@@ -1,0 +1,28 @@
+# Apply only after the service validates JWT locally. The NLB can be called
+# directly, bypassing the API Gateway authorizer.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mecanica-execucao
+  namespace: mecanica
+spec:
+  ingressClassName: traefik
+  rules:
+    - http:
+        paths:
+          - path: /execucoes
+            pathType: Prefix
+            backend: &execucao_backend
+              service:
+                name: mecanica-execucao
+                port:
+                  number: 8080
+          - path: /pecas
+            pathType: Prefix
+            backend: *execucao_backend
+          - path: /prestacoes
+            pathType: Prefix
+            backend: *execucao_backend
+          - path: /alocacoes
+            pathType: Prefix
+            backend: *execucao_backend

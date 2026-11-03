@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: Tests and JaCoCo instruction coverage >= 80%
+        run: ./mvnw -B clean verify
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: jacoco-report
+          path: target/site/jacoco/
+          if-no-files-found: ignore
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.15.8
+      - name: Terraform format
+        working-directory: infra
+        run: terraform fmt -check -recursive
+      - name: Terraform init without AWS backend
+        working-directory: infra
+        run: terraform init -backend=false -input=false
+      - name: Terraform validate
+        working-directory: infra
+        run: terraform validate -no-color
+      - name: SonarCloud quality gate
+        if: vars.SONAR_PROJECT_KEY != ''
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_PROJECT_KEY: ${{ vars.SONAR_PROJECT_KEY }}
+          SONAR_ORGANIZATION: ${{ vars.SONAR_ORGANIZATION }}
+        run: |
+          test -n "$SONAR_TOKEN"
+          test -n "$SONAR_ORGANIZATION"
+          ./mvnw -B sonar:sonar -Dsonar.host.url=https://sonarcloud.io \
+            -Dsonar.projectKey="$SONAR_PROJECT_KEY" \
+            -Dsonar.organization="$SONAR_ORGANIZATION" \
+            -Dsonar.token="$SONAR_TOKEN" \
+            -Dsonar.qualitygate.wait=true

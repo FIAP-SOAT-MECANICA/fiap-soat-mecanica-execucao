@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mecanica-execucao
+  namespace: mecanica
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: mecanica-execucao
+  template:
+    metadata:
+      labels:
+        app: mecanica-execucao
+        app.kubernetes.io/part-of: fiap-soat-mecanica
+        tags.datadoghq.com/service: mecanica-execucao
+        tags.datadoghq.com/env: prd
+      annotations:
+        instrumentation.opentelemetry.io/inject-java: mecanica/java-instrumentation
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: execucao
+          image: ${IMAGE_URI}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: AWS_REGION
+              value: ${AWS_REGION}
+            - name: EXECUCAO_ORDENS_TABLE
+              value: ${EXECUCAO_ORDENS_TABLE}
+            - name: EXECUCAO_PECAS_TABLE
+              value: ${EXECUCAO_PECAS_TABLE}
+            - name: EXECUCAO_RESERVAS_TABLE
+              value: ${EXECUCAO_RESERVAS_TABLE}
+            - name: EXECUCAO_OUTBOX_TABLE
+              value: ${EXECUCAO_OUTBOX_TABLE}
+            - name: EXECUCAO_IDEMPOTENCIA_TABLE
+              value: ${EXECUCAO_IDEMPOTENCIA_TABLE}
+            - name: EXECUCAO_COMMAND_QUEUE_URL
+              value: ${EXECUCAO_COMMAND_QUEUE_URL}
+            - name: EXECUCAO_EVENT_TOPIC_ARN
+              value: ${EXECUCAO_EVENT_TOPIC_ARN}
+            - name: SERVER_SHUTDOWN
+              value: graceful
+            - name: OTEL_INSTRUMENTATION_AWS_SDK_EXPERIMENTAL_USE_PROPAGATOR_FOR_MESSAGING
+              value: "true"
+          resources:
+            requests:
+              cpu: 250m
+              memory: 384Mi
+            limits:
+              cpu: 500m
+              memory: 768Mi
+          readinessProbe:
+            httpGet:
+              path: /actuator/health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /actuator/health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 3

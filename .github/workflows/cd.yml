@@ -1,0 +1,105 @@
+name: Deploy Execucao
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Type deploy to provision AWS and roll out the service
+        required: true
+        type: choice
+        options: [cancel, deploy]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: execucao-production-state
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: inputs.confirm == 'deploy'
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      AWS_REGION: us-east-1
+      EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME || 'mecanica' }}
+      TF_VAR_project: ${{ vars.PROJECT_NAME || 'mecanica' }}
+      TF_IN_AUTOMATION: 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: Verify tests and 80% instruction coverage
+        run: ./mvnw -B clean verify
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Check AWS session and locate state bucket
+        id: account
+        run: |
+          account_id="$(aws sts get-caller-identity --query Account --output text)"
+          echo "bucket=mecanica-tfstate-${account_id}" >> "$GITHUB_OUTPUT"
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.15.8
+          terraform_wrapper: false
+      - name: Terraform init
+        working-directory: infra
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ steps.account.outputs.bucket }}" \
+            -backend-config="key=execucao/terraform.tfstate" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="use_lockfile=true"
+      - name: Terraform plan and apply
+        working-directory: infra
+        run: |
+          terraform fmt -check -recursive
+          terraform validate -no-color
+          terraform plan -input=false -out=tfplan
+          terraform apply -input=false tfplan
+      - name: Export resource locations
+        working-directory: infra
+        run: |
+          echo "ECR_URL=$(terraform output -raw ecr_repository_url)" >> "$GITHUB_ENV"
+          echo "EXECUCAO_ORDENS_TABLE=$(terraform output -json table_names | jq -r .ordens)" >> "$GITHUB_ENV"
+          echo "EXECUCAO_PECAS_TABLE=$(terraform output -json table_names | jq -r .pecas)" >> "$GITHUB_ENV"
+          echo "EXECUCAO_RESERVAS_TABLE=$(terraform output -json table_names | jq -r .reservas)" >> "$GITHUB_ENV"
+          echo "EXECUCAO_OUTBOX_TABLE=$(terraform output -json table_names | jq -r .outbox)" >> "$GITHUB_ENV"
+          echo "EXECUCAO_IDEMPOTENCIA_TABLE=$(terraform output -json table_names | jq -r .idempotencia)" >> "$GITHUB_ENV"
+          echo "EXECUCAO_COMMAND_QUEUE_URL=$(terraform output -raw command_queue_url)" >> "$GITHUB_ENV"
+          echo "EXECUCAO_EVENT_TOPIC_ARN=$(terraform output -raw event_topic_arn)" >> "$GITHUB_ENV"
+      - name: Build and push immutable image
+        run: |
+          image_uri="${ECR_URL}:${GITHUB_SHA}"
+          repository="${ECR_URL#*/}"
+          if aws ecr describe-images --repository-name "$repository" --image-ids imageTag="$GITHUB_SHA" >/dev/null 2>&1; then
+            echo "Image already exists for this commit"
+          else
+            aws ecr get-login-password --region "$AWS_REGION" |
+              docker login --username AWS --password-stdin "${ECR_URL%%/*}"
+            docker build -t "$image_uri" .
+            docker push "$image_uri"
+          fi
+          echo "IMAGE_URI=$image_uri" >> "$GITHUB_ENV"
+      - uses: azure/setup-kubectl@v4
+      - name: Verify shared cluster prerequisites
+        run: |
+          aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
+          kubectl get namespace mecanica
+          kubectl -n mecanica get instrumentation java-instrumentation
+      - name: Roll out internal service
+        run: |
+          command -v envsubst
+          envsubst < k8s/deployment.yaml | kubectl apply -f -
+          kubectl apply -f k8s/service.yaml
+          kubectl apply -f k8s/hpa.yaml
+          kubectl -n mecanica rollout status deployment/mecanica-execucao --timeout=300s
+          kubectl -n mecanica get deployment,service,hpa mecanica-execucao

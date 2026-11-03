@@ -17,3 +17,39 @@ O endpoint `GET /actuator/health` verifica a aplicação; `GET /execucoes/{osId}
 - `execucao-reservas`: chave de partição `osId` e chave de ordenação `pecaId` (String)
 
 As três tabelas de diagnóstico participam da mesma `TransactWriteItems`. A reserva de peças também usa `TransactWriteItems` condicional. Seu evento é gravado após a mutação; se a gravação do evento falhar, a mensagem SQS será repetida e a operação de estoque idempotente permitirá completar a outbox. O publicador varre a outbox pendente; após a publicação, remove o item. Em caso de falha entre publicação e remoção, pode publicar novamente, portanto os consumidores também precisam deduplicar por `messageId`.
+
+## Infraestrutura e entrega
+
+`infra/` provisiona as cinco tabelas DynamoDB sob demanda, o índice `fila`
+(`filaStatus` String + `filaOrdem` String, projeção completa), TTL `expiresAt`
+na idempotência, a fila `mecanica-execucao-comandos` com DLQ (5 tentativas),
+o tópico `mecanica-execucao-eventos` e um repositório ECR com tags imutáveis.
+Os nomes das tabelas correspondem aos defaults de `application.properties`.
+As saídas do Terraform incluem URLs/ARNs para o CD; as localizações usadas
+pelo serviço OS também são publicadas no SSM em
+`/mecanica/execucao/command-queue-url` e `/mecanica/execucao/event-topic-arn`.
+O OS é dono da assinatura de sua fila de respostas no tópico de Execução.
+
+O CI executa `mvn verify` com JaCoCo exigindo pelo menos 80% de instruções,
+valida o Terraform e, quando `SONAR_PROJECT_KEY`, `SONAR_ORGANIZATION` e
+`SONAR_TOKEN` estão configurados, aguarda o Quality Gate do SonarCloud. O
+relatório JaCoCo fica nos artefatos do workflow. Configure esses três valores
+e torne o check do CI obrigatório na proteção da branch `main`.
+
+O CD é um `workflow_dispatch` com confirmação `deploy` e environment
+`production`. Configure revisão obrigatória nesse environment antes do primeiro
+uso. Ele requer os secrets `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` e
+`AWS_SESSION_TOKEN` de uma sessão ativa do Learner Lab, e um bucket de state
+`mecanica-tfstate-<account-id>` criado pelo repositório `-k8s`. O cluster,
+namespace `mecanica` e Instrumentation compartilhada precisam existir. O
+workflow aplica a infraestrutura, publica a imagem do SHA no ECR e faz rollout
+do Deployment, Service e HPA. O pod usa a cadeia padrão de credenciais da AWS
+por meio da role dos nodes; a permissão dessa role para DynamoDB, SQS e SNS
+deve ser verificada na conta final. Credenciais de sessão não são guardadas no
+manifesto. Para testes locais, `AWS_SESSION_TOKEN` é reconhecido junto com a
+access key e secret key.
+
+O arquivo `k8s/ingress.yaml` fica fora do CD até o serviço validar o JWT
+localmente: o NLB público do repositório `-k8s` também pode ser acessado sem
+passar pelo Lambda Authorizer. Revise as rotas e ative o Ingress apenas após
+essa validação. O endpoint `GET /actuator/health` serve às probes do pod.
