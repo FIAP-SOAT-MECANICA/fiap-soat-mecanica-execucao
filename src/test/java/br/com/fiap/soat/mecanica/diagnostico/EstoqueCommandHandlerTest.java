@@ -21,7 +21,7 @@ class EstoqueCommandHandlerTest {
     private final EventoOutbox outbox = mock(EventoOutbox.class);
     private final ObjectMapper mapper = new ObjectMapper();
     private final EstoqueCommandHandler handler = new EstoqueCommandHandler(estoque, outbox, mapper,
-            Clock.fixed(Instant.parse("2026-11-03T12:00:00Z"), ZoneOffset.UTC));
+            Clock.fixed(Instant.parse("2026-11-03T12:00:00Z"), ZoneOffset.UTC), mock(ExecucaoWorkflowService.class));
     private final UUID osId = UUID.randomUUID();
     private final UUID pecaId = UUID.randomUUID();
 
@@ -40,6 +40,18 @@ class EstoqueCommandHandlerTest {
         doThrow(new EstoqueConflitoTransitorioException("conflito", null))
                 .when(estoque).reservar(eq(osId), anyMap());
         assertThrows(EstoqueConflitoTransitorioException.class, () -> handler.executar(reservar()));
+        verifyNoInteractions(outbox);
+    }
+
+    @Test void iniciarExecucaoConfirmaReservaETransicionaOrdem() {
+        var workflow = mock(ExecucaoWorkflowService.class);
+        var integrated = new EstoqueCommandHandler(estoque, outbox, mapper, Clock.systemUTC(), workflow);
+        var command = new MessageEnvelope(UUID.randomUUID(), "IniciarExecucao", 1, UUID.randomUUID(),
+                osId, "trace", null, Instant.now(), mapper.createObjectNode().put("osId", osId.toString()));
+        integrated.executar(command);
+        var sequence = inOrder(estoque, workflow);
+        sequence.verify(estoque).confirmar(osId);
+        sequence.verify(workflow).iniciarExecucao(osId, "trace");
         verifyNoInteractions(outbox);
     }
 

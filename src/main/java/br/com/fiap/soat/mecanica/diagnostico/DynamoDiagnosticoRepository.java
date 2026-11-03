@@ -1,5 +1,6 @@
 package br.com.fiap.soat.mecanica.diagnostico;
 
+import br.com.fiap.soat.mecanica.consultas.FilaKey;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.HashMap;
@@ -43,6 +44,10 @@ class DynamoDiagnosticoRepository implements DiagnosticoRepository {
         order.put("placa", s(ordem.placa()));
         order.put("abertaEm", s(ordem.abertaEm().toString()));
         order.put("status", s(ordem.status()));
+        order.put("prioridade", AttributeValue.fromN("0"));
+        order.put("version", AttributeValue.fromN("0"));
+        order.put("prestacoes", AttributeValue.builder().l(java.util.List.of()).build());
+        order.putAll(FilaKey.attributes(ordem.status(), ordem.abertaEm().toString(), ordem.osId()));
         Map<String, AttributeValue> idempotencia = Map.of(
                 "messageId", s(commandId.toString()), "osId", s(ordem.osId().toString()),
                 "expiresAt", AttributeValue.builder().n(Long.toString(ordem.abertaEm().plusSeconds(604800).getEpochSecond())).build());

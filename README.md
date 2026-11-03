@@ -8,6 +8,14 @@ Java 21 e Maven Wrapper: `./mvnw.cmd test` no Windows ou `./mvnw test` no Linux.
 
 O endpoint `GET /actuator/health` verifica a aplicação; `GET /execucoes/{osId}` consulta o diagnóstico. A fila deve ser padrão, ter DLQ e receber mensagens com entrega bruta. O tópico deve ter assinatura para a fila de respostas da Saga no serviço OS.
 
+## Diagnóstico e prestações
+
+Configure `EXECUCAO_OS_BASE_URL` para validar e guardar o nome do serviço a partir de `GET /servicos/{id}` no serviço OS (cache local de 5 minutos). As peças de `execucao-pecas` precisam de `valorUnitario` para formar o snapshot do orçamento.
+
+Durante `EM_DIAGNOSTICO`, use `POST /execucoes/{osId}/prestacoes` com `{ "servicoId": "UUID", "precoMdo": 80.00 }`, `POST /execucoes/{osId}/prestacoes/{id}/pecas` com `{ "pecaId": "UUID", "qtd": 2 }`, `PATCH /prestacoes/{id}/inativar` ou `PATCH /alocacoes/{id}/inativar`. `PATCH /execucoes/{osId}/diagnostico/concluir` exige ao menos uma prestação ativa e grava `DiagnosticoConcluido` na outbox junto da transição para `AGUARDANDO_APROVACAO`.
+
+O comando `IniciarExecucao` confirma a reserva e muda a execução para `EM_EXECUCAO`, iniciando as prestações ativas. `PATCH /prestacoes/{id}/finalizar` conclui uma prestação; a última ativa muda a execução para `FINALIZADA` e grava `ExecucaoFinalizada` na mesma transação. As mudanças no documento usam versão otimista; conflitos retornam 409 para uma nova tentativa. O lookup dos IDs de prestação e alocação hoje usa scan paginado e deve ganhar índice dedicado quando o volume crescer.
+
 ## Tabelas DynamoDB
 
 - `execucao-ordens`: chave de partição `osId` (String)

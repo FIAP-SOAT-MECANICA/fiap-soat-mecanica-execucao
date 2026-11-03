@@ -17,12 +17,15 @@ class EstoqueCommandHandler {
     private final EventoOutbox outbox;
     private final ObjectMapper mapper;
     private final Clock clock;
+    private final ExecucaoWorkflowService workflow;
 
-    EstoqueCommandHandler(EstoqueService estoque, EventoOutbox outbox, ObjectMapper mapper, Clock clock) {
+    EstoqueCommandHandler(EstoqueService estoque, EventoOutbox outbox, ObjectMapper mapper, Clock clock,
+            ExecucaoWorkflowService workflow) {
         this.estoque = estoque;
         this.outbox = outbox;
         this.mapper = mapper;
         this.clock = clock;
+        this.workflow = workflow;
     }
 
     boolean supports(String type) {
@@ -63,7 +66,8 @@ class EstoqueCommandHandler {
             }
             case "IniciarExecucao" -> {
                 estoque.confirmar(command.osId());
-                eventType = "ExecucaoIniciada";
+                workflow.iniciarExecucao(command.osId(), command.correlationId());
+                return; // The order transition and ExecucaoIniciada outbox write are atomic.
             }
             default -> throw new IllegalArgumentException("Comando de estoque desconhecido");
         }

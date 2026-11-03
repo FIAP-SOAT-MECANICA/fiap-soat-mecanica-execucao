@@ -72,7 +72,9 @@ class DiagnosticoLocalStackTest {
                     new br.com.fiap.soat.mecanica.estoque.EstoqueService(
                             new br.com.fiap.soat.mecanica.estoque.DynamoEstoqueRepository(dynamo,
                                     "execucao-pecas", "execucao-reservas")),
-                    new EventoOutbox(dynamo, mapper, "execucao-outbox"), mapper, Clock.systemUTC());
+                    new EventoOutbox(dynamo, mapper, "execucao-outbox"), mapper, Clock.systemUTC(),
+                    new ExecucaoWorkflowService(dynamo, mapper, Clock.systemUTC(), id -> "Serviço",
+                            "execucao-ordens", "execucao-pecas", "execucao-outbox"));
             var consumer = new DiagnosticoCommandConsumer(sqs, mapper, useCase, stock, commandQueue);
             var publisher = new DiagnosticoOutboxPublisher(dynamo, sns, "execucao-outbox", topic);
             UUID osId = UUID.randomUUID();
