@@ -2,9 +2,9 @@ name: CI
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, josen/execucao-dev-d]
   push:
-    branches: [main]
+    branches: [main, josen/execucao-dev-d]
 
 permissions:
   contents: read
