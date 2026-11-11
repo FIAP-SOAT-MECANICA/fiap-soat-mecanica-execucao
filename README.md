@@ -28,6 +28,8 @@ Configure `EXECUCAO_OS_BASE_URL` para validar e guardar o nome do serviço a par
 
 Durante `EM_DIAGNOSTICO`, use `POST /execucoes/{osId}/prestacoes` com `{ "servicoId": "UUID", "precoMdo": 80.00 }`, `POST /execucoes/{osId}/prestacoes/{id}/pecas` com `{ "pecaId": "UUID", "qtd": 2 }`, `PATCH /prestacoes/{id}/inativar` ou `PATCH /alocacoes/{id}/inativar`. `PATCH /execucoes/{osId}/diagnostico/concluir` exige ao menos uma prestação ativa e grava `DiagnosticoConcluido` na outbox junto da transição para `AGUARDANDO_APROVACAO`.
 
+O cadastro de peças usa `POST /pecas` e `PUT /pecas/{id}` com `{ "nome": "Filtro", "descricao": "Filtro de óleo", "valorUnitario": 29.90, "qtdEstoque": 1 }`. `GET /pecas` e `GET /pecas/{id}` retornam também `qtdDisponivel` e `qtdReservada`. A criação responde 201 com `Location`; alterações incompatíveis com uma reserva respondem 409.
+
 O comando `IniciarExecucao` confirma a reserva e muda a execução para `EM_EXECUCAO`, iniciando as prestações ativas. `PATCH /prestacoes/{id}/finalizar` conclui uma prestação; a última ativa muda a execução para `FINALIZADA` e grava `ExecucaoFinalizada` na mesma transação. As mudanças no documento usam versão otimista; conflitos retornam 409 para uma nova tentativa. O lookup dos IDs de prestação e alocação hoje usa scan paginado e deve ganhar índice dedicado quando o volume crescer.
 
 ## Tabelas DynamoDB

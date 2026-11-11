@@ -21,7 +21,7 @@ Invoke-RestMethod "$BaseUrl/actuator/health" | Out-Null
 $osId = [guid]::NewGuid().ToString()
 $sagaId = [guid]::NewGuid().ToString()
 $commandId = [guid]::NewGuid().ToString()
-$pecaId = [guid]::NewGuid().ToString()
+$pecaId = $null
 $opened = @{
     messageId = $commandId; type = 'AbrirDiagnostico'; version = 1
     sagaId = $sagaId; osId = $osId; correlationId = "demo-$osId"
@@ -41,10 +41,13 @@ if (-not $order -or $order.status -ne 'EM_DIAGNOSTICO') {
     throw 'AbrirDiagnostico did not create an order in EM_DIAGNOSTICO.'
 }
 
-$item = @{ pecaId = @{ S = $pecaId }; nome = @{ S = 'Filtro de óleo' }
-    valorUnitario = @{ N = '29.90' }; qtdEstoque = @{ N = '1' }
-    qtdDisponivel = @{ N = '1' }; qtdReservada = @{ N = '0' } } | ConvertTo-Json -Depth 6 -Compress
-Invoke-LocalAws @('dynamodb', 'put-item', '--table-name', 'execucao-pecas', '--item', $item) | Out-Null
+$pieceBody = @{ nome = 'Filtro de óleo'; descricao = 'Peça de demonstração'
+    valorUnitario = 29.90; qtdEstoque = 1 } | ConvertTo-Json -Compress
+$piece = Invoke-RestMethod "$BaseUrl/pecas" -Method Post -ContentType 'application/json' -Body $pieceBody
+$pecaId = $piece.pecaId
+if (-not $pecaId -or $piece.qtdDisponivel -ne 1 -or $piece.qtdReservada -ne 0) {
+    throw 'POST /pecas did not create one available piece.'
+}
 $reserveId = [guid]::NewGuid().ToString()
 $reserve = @{
     messageId = $reserveId; type = 'ReservarPecas'; version = 1
@@ -64,6 +67,10 @@ for ($attempt = 0; $attempt -lt 20; $attempt++) {
 }
 if ($stock.Item.qtdDisponivel.N -ne '0' -or $stock.Item.qtdReservada.N -ne '1') {
     throw 'ReservarPecas did not atomically update stock.'
+}
+$pieceAfterReserve = Invoke-RestMethod "$BaseUrl/pecas/$pecaId"
+if ($pieceAfterReserve.qtdDisponivel -ne 0 -or $pieceAfterReserve.qtdReservada -ne 1) {
+    throw 'GET /pecas/{id} disagrees with the reserved stock.'
 }
 
 $eventTypes = [System.Collections.Generic.HashSet[string]]::new()
@@ -118,6 +125,10 @@ for ($attempt = 0; $attempt -lt 20; $attempt++) {
     Start-Sleep -Seconds 1
 }
 if (-not $restored) { throw 'LiberarReservaPecas did not restore availability.' }
+$pieceAfterRelease = Invoke-RestMethod "$BaseUrl/pecas/$pecaId"
+if ($pieceAfterRelease.qtdDisponivel -ne 1 -or $pieceAfterRelease.qtdReservada -ne 0) {
+    throw 'GET /pecas/{id} disagrees with the released stock.'
+}
 $markerKey = @{ messageId = @{ S = $commandId } } | ConvertTo-Json -Depth 4 -Compress
 $marker = Invoke-LocalAws @('dynamodb', 'get-item', '--table-name', 'execucao-idempotencia',
     '--key', $markerKey, '--output', 'json') | ConvertFrom-Json
