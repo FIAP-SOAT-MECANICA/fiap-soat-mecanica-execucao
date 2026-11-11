@@ -71,7 +71,8 @@ class DiagnosticoLocalStackTest {
             var stock = new EstoqueCommandHandler(
                     new br.com.fiap.soat.mecanica.estoque.EstoqueService(
                             new br.com.fiap.soat.mecanica.estoque.DynamoEstoqueRepository(dynamo,
-                                    "execucao-pecas", "execucao-reservas")),
+                                    "execucao-pecas", "execucao-reservas", "execucao-idempotencia",
+                                    "execucao-outbox", mapper)),
                     new EventoOutbox(dynamo, mapper, "execucao-outbox"), mapper, Clock.systemUTC(),
                     new ExecucaoWorkflowService(dynamo, mapper, Clock.systemUTC(), id -> "Serviço",
                             "execucao-ordens", "execucao-pecas", "execucao-outbox"));

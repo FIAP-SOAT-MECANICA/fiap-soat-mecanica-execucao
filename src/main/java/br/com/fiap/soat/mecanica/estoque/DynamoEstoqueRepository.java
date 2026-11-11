@@ -1,5 +1,7 @@
 package br.com.fiap.soat.mecanica.estoque;
 
+import br.com.fiap.soat.mecanica.diagnostico.MessageEnvelope;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -32,18 +34,38 @@ public final class DynamoEstoqueRepository implements EstoqueRepository {
     private final DynamoDbClient client;
     private final String pecasTable;
     private final String reservasTable;
+    private final String outboxTable;
+    private final String idempotenciaTable;
+    private final ObjectMapper mapper;
 
     public DynamoEstoqueRepository(DynamoDbClient client, String pecasTable, String reservasTable) {
+        this(client, pecasTable, reservasTable, null, null, null);
+    }
+
+    public DynamoEstoqueRepository(DynamoDbClient client, String pecasTable, String reservasTable,
+            String idempotenciaTable, String outboxTable, ObjectMapper mapper) {
         this.client = Objects.requireNonNull(client);
         this.pecasTable = requireName(pecasTable);
         this.reservasTable = requireName(reservasTable);
+        this.outboxTable = outboxTable;
+        this.idempotenciaTable = idempotenciaTable;
+        this.mapper = mapper;
     }
 
     @Override
     public void reservar(ReservaEstoque reserva) {
+        reservar(reserva, null);
+    }
+
+    @Override
+    public void reservar(ReservaEstoque reserva, MessageEnvelope event) {
+        if (event != null && jaProcessado(event.causationId())) return;
+        if (event != null && reserva.pecas().size() > 49)
+            throw new IllegalArgumentException("A reserva com evento comporta ate 49 pecas");
         List<Reservation> previous = readReservations(reserva.osId());
         if (!previous.isEmpty()) {
             checkIdenticalReservation(reserva, previous);
+            if (event != null) registrarResultado(event);
             return;
         }
         List<TransactWriteItem> actions = new ArrayList<>();
@@ -55,19 +77,24 @@ public final class DynamoEstoqueRepository implements EstoqueRepository {
             actions.add(TransactWriteItem.builder().update(Update.builder()
                     .tableName(pecasTable).key(pieceKey(pecaId))
                     .updateExpression("ADD qtdDisponivel :menos, qtdReservada :qtd")
-                    .conditionExpression("attribute_exists(pecaId) AND qtdDisponivel >= :qtd")
-                    .expressionAttributeValues(quantityValues(qtd)).build()).build());
+                    .conditionExpression("attribute_exists(pecaId) AND (attribute_not_exists(ativo) OR ativo = :ativo) AND qtdDisponivel >= :qtd")
+                    .expressionAttributeValues(reservationValues(qtd)).build()).build());
             actions.add(TransactWriteItem.builder().put(Put.builder()
                     .tableName(reservasTable)
                     .item(Map.of("osId", s(reserva.osId()), "pecaId", s(pecaId),
                             "quantidade", n(qtd), "estado", AttributeValue.fromS(RESERVED)))
                     .conditionExpression("attribute_not_exists(osId)").build()).build());
         });
+        if (event != null) {
+            actions.add(markerAction(event));
+            actions.add(outboxAction(event));
+        }
         try {
-            transact("reservar", reserva.osId(), actions);
+            transact("reservar", reserva.osId(), actions, event);
         } catch (TransactionCanceledException failure) {
             List<Reservation> existing = readReservations(reserva.osId());
             if (existing.isEmpty()) {
+                if (event != null && jaProcessado(event.causationId())) return;
                 boolean transientConflict = failure.cancellationReasons().stream()
                         .anyMatch(reason -> "TransactionConflict".equals(reason.code()));
                 if (transientConflict) {
@@ -85,6 +112,7 @@ public final class DynamoEstoqueRepository implements EstoqueRepository {
                         "Reserva temporariamente indisponivel para OS " + reserva.osId(), failure);
             }
             checkIdenticalReservation(reserva, existing);
+            if (event != null) registrarResultado(event);
         } catch (IdempotentParameterMismatchException failure) {
             throw new EstoqueException("Reserva divergente para OS " + reserva.osId(), failure);
         }
@@ -101,20 +129,27 @@ public final class DynamoEstoqueRepository implements EstoqueRepository {
 
     @Override
     public void confirmar(UUID osId) {
-        changeState(osId, CONFIRMED);
+        changeState(osId, CONFIRMED, null);
     }
 
     @Override
     public void liberar(UUID osId) {
-        changeState(osId, RELEASED);
+        changeState(osId, RELEASED, null);
     }
 
-    private void changeState(UUID osId, String target) {
+    @Override
+    public void liberar(UUID osId, MessageEnvelope event) {
+        if (jaProcessado(event.causationId())) return;
+        changeState(osId, RELEASED, event);
+    }
+
+    private void changeState(UUID osId, String target, MessageEnvelope event) {
         List<Reservation> reservations = readReservations(osId);
         if (reservations.isEmpty()) {
             throw new EstoqueException("Reserva nao encontrada para OS " + osId);
         }
         if (reservations.stream().allMatch(r -> target.equals(r.state()))) {
+            if (event != null) registrarResultado(event);
             return;
         }
         if (reservations.stream().anyMatch(r -> !RESERVED.equals(r.state()))) {
@@ -142,14 +177,60 @@ public final class DynamoEstoqueRepository implements EstoqueRepository {
                     .conditionExpression("estado = :reservada")
                     .expressionAttributeValues(values).build()).build());
         }
+        if (event != null) {
+            actions.add(markerAction(event));
+            actions.add(outboxAction(event));
+        }
         try {
-            transact(target, osId, actions);
+            transact(target, osId, actions, event);
         } catch (TransactionCanceledException failure) {
             List<Reservation> current = readReservations(osId);
             if (current.size() != reservations.size()
                     || current.stream().anyMatch(r -> !target.equals(r.state()))) {
                 throw new EstoqueException("Nao foi possivel finalizar reserva da OS " + osId, failure);
             }
+            if (event != null) registrarResultado(event);
+        }
+    }
+
+    private TransactWriteItem outboxAction(MessageEnvelope event) {
+        if (outboxTable == null || mapper == null)
+            throw new IllegalStateException("Outbox do estoque nao configurada");
+        try {
+            return TransactWriteItem.builder().put(Put.builder().tableName(outboxTable)
+                    .item(Map.of("eventId", s(event.messageId()),
+                            "body", AttributeValue.fromS(mapper.writeValueAsString(event)),
+                            "createdAt", AttributeValue.fromS(event.occurredAt().toString())))
+                    .conditionExpression("attribute_not_exists(eventId)").build()).build();
+        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+            throw new IllegalStateException("Falha ao serializar evento", e);
+        }
+    }
+
+    private TransactWriteItem markerAction(MessageEnvelope event) {
+        if (idempotenciaTable == null || event.causationId() == null)
+            throw new IllegalStateException("Idempotencia do estoque nao configurada");
+        return TransactWriteItem.builder().put(Put.builder().tableName(idempotenciaTable)
+                .item(Map.of("messageId", s(event.causationId()), "osId", s(event.osId())))
+                .conditionExpression("attribute_not_exists(messageId)").build()).build();
+    }
+
+    @Override
+    public boolean jaProcessado(UUID messageId) {
+        if (idempotenciaTable == null || messageId == null) return false;
+        var item = client.getItem(b -> b.tableName(idempotenciaTable)
+                .key(Map.of("messageId", s(messageId))).consistentRead(true)).item();
+        return item != null && !item.isEmpty();
+    }
+
+    @Override
+    public void registrarResultado(MessageEnvelope event) {
+        if (jaProcessado(event.causationId())) return;
+        try {
+            client.transactWriteItems(TransactWriteItemsRequest.builder().transactItems(
+                    markerAction(event), outboxAction(event)).build());
+        } catch (TransactionCanceledException e) {
+            if (!jaProcessado(event.causationId())) throw e;
         }
     }
 
@@ -174,6 +255,7 @@ public final class DynamoEstoqueRepository implements EstoqueRepository {
             var item = client.getItem(b -> b.tableName(pecasTable).key(pieceKey(pieceId))
                     .consistentRead(true)).item();
             int available = item == null || !item.containsKey("qtdDisponivel")
+                    || (item.containsKey("ativo") && Boolean.FALSE.equals(item.get("ativo").bool()))
                     ? 0 : Integer.parseInt(item.get("qtdDisponivel").n());
             if (available < requested) {
                 missing.put(pieceId, requested - available);
@@ -182,14 +264,19 @@ public final class DynamoEstoqueRepository implements EstoqueRepository {
         return missing;
     }
 
-    private void transact(String operation, UUID osId, List<TransactWriteItem> actions) {
-        String token = UUID.nameUUIDFromBytes((operation + ":" + osId).getBytes(StandardCharsets.UTF_8)).toString();
+    private void transact(String operation, UUID osId, List<TransactWriteItem> actions, MessageEnvelope event) {
+        String token = UUID.nameUUIDFromBytes((operation + ":" + osId + ":"
+                + (event == null ? "legacy" : event.causationId())).getBytes(StandardCharsets.UTF_8)).toString();
         client.transactWriteItems(TransactWriteItemsRequest.builder()
                 .clientRequestToken(token).transactItems(actions).build());
     }
 
     private static Map<String, AttributeValue> quantityValues(int qtd) {
         return Map.of(":qtd", n(qtd), ":menos", n(-qtd));
+    }
+
+    private static Map<String, AttributeValue> reservationValues(int qtd) {
+        return Map.of(":qtd", n(qtd), ":menos", n(-qtd), ":ativo", AttributeValue.fromBool(true));
     }
 
     private static Map<String, AttributeValue> pieceKey(UUID pecaId) {

@@ -2,7 +2,12 @@ package br.com.fiap.soat.mecanica.estoque;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 
+import br.com.fiap.soat.mecanica.diagnostico.MessageEnvelope;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.time.Instant;
+import java.math.BigDecimal;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.Callable;
@@ -39,6 +44,9 @@ class DynamoEstoqueRepositoryTest {
     private DynamoDbClient client;
     private EstoqueService service;
     private UUID pecaId;
+    private String outboxTable;
+    private String idempotenciaTable;
+    private PecaRepository pecas;
 
     @BeforeEach
     void setUp() {
@@ -51,15 +59,21 @@ class DynamoEstoqueRepositoryTest {
         String suffix = UUID.randomUUID().toString().replace("-", "");
         String pecasTable = "pecas" + suffix;
         String reservasTable = "reservas" + suffix;
+        outboxTable = "outbox" + suffix;
+        idempotenciaTable = "idem" + suffix;
         createTable(pecasTable, "pecaId", null);
         createTable(reservasTable, "osId", "pecaId");
+        createTable(outboxTable, "eventId", null);
+        createTable(idempotenciaTable, "messageId", null);
         pecaId = UUID.randomUUID();
         client.putItem(b -> b.tableName(pecasTable).item(Map.of(
                 "pecaId", AttributeValue.fromS(pecaId.toString()),
                 "qtdEstoque", AttributeValue.fromN("1"),
                 "qtdDisponivel", AttributeValue.fromN("1"),
                 "qtdReservada", AttributeValue.fromN("0"))));
-        service = new EstoqueService(new DynamoEstoqueRepository(client, pecasTable, reservasTable));
+        service = new EstoqueService(new DynamoEstoqueRepository(client, pecasTable, reservasTable,
+                idempotenciaTable, outboxTable, new ObjectMapper().findAndRegisterModules()));
+        pecas = new DynamoPecaRepository(client, pecasTable);
         this.pecasTable = pecasTable;
     }
 
@@ -122,6 +136,75 @@ class DynamoEstoqueRepositoryTest {
         assertEquals(Map.of(semEstoque, 1), shortage.faltantes());
         assertEquals("1", piece().get("qtdDisponivel").n());
         assertEquals("0", piece().get("qtdReservada").n());
+    }
+
+    @Test
+    void reservaELiberacaoGravamEventoNaMesmaTransacao() {
+        UUID osId = UUID.randomUUID();
+        MessageEnvelope reservada = event(osId, "PecasReservadas");
+        service.reservar(osId, Map.of(pecaId, 1), reservada);
+        assertFalse(outbox(reservada.messageId()).isEmpty());
+        assertEquals("0", piece().get("qtdDisponivel").n());
+        MessageEnvelope liberada = event(osId, "ReservaPecasLiberada");
+        service.liberar(osId, liberada);
+        assertFalse(outbox(liberada.messageId()).isEmpty());
+        assertEquals("1", piece().get("qtdDisponivel").n());
+        client.deleteItem(b -> b.tableName(outboxTable)
+                .key(Map.of("eventId", AttributeValue.fromS(reservada.messageId().toString()))));
+        service.reservar(osId, Map.of(pecaId, 1), reservada);
+        assertEquals(true, outbox(reservada.messageId()).isEmpty());
+        assertEquals("1", piece().get("qtdDisponivel").n());
+    }
+
+    @Test
+    void falhaNoOutboxReverteReserva() {
+        UUID osId = UUID.randomUUID();
+        MessageEnvelope event = event(osId, "PecasReservadas");
+        client.deleteTable(b -> b.tableName(outboxTable));
+        assertThrows(RuntimeException.class, () -> service.reservar(osId, Map.of(pecaId, 1), event));
+        assertEquals("1", piece().get("qtdDisponivel").n());
+        assertEquals("0", piece().get("qtdReservada").n());
+    }
+
+    @Test
+    void recusaTemMarcadorDuravelAposPublicacaoDoEvento() {
+        var event = event(UUID.randomUUID(), "ReservaPecasRecusada");
+        service.registrarResultado(event);
+        assertEquals(true, service.jaProcessado(event.causationId()));
+        client.deleteItem(b -> b.tableName(outboxTable)
+                .key(Map.of("eventId", AttributeValue.fromS(event.messageId().toString()))));
+        service.registrarResultado(event);
+        assertEquals(true, outbox(event.messageId()).isEmpty());
+        service.reservar(event.osId(), Map.of(pecaId, 1), event);
+        assertEquals("1", piece().get("qtdDisponivel").n());
+    }
+
+    @Test
+    void crudDePecasPreservaReservasEQuantidades() {
+        UUID id = UUID.randomUUID();
+        var criada = new Peca(id, "Filtro", "Filtro de óleo", new BigDecimal("20.00"), 3, 3, 0);
+        pecas.criar(criada);
+        assertEquals(criada, pecas.buscar(id).orElseThrow());
+        assertEquals(2, pecas.listar().size());
+        var atualizada = pecas.atualizar(new Peca(id, "Filtro novo", "Filtro de óleo",
+                new BigDecimal("22.00"), 4, 4, 0));
+        assertEquals(4, atualizada.qtdDisponivel());
+        UUID osId = UUID.randomUUID();
+        service.reservar(osId, Map.of(id, 2));
+        assertThrows(EstoqueException.class, () -> pecas.atualizar(new Peca(id, "Filtro",
+                "Filtro de óleo", BigDecimal.ONE, 1, 1, 0)));
+        service.liberar(osId);
+        assertEquals(4, pecas.buscar(id).orElseThrow().qtdDisponivel());
+    }
+
+    private MessageEnvelope event(UUID osId, String type) {
+        return new MessageEnvelope(UUID.randomUUID(), type, 1, UUID.randomUUID(), osId,
+                "trace", UUID.randomUUID(), Instant.now(), new ObjectMapper().createObjectNode());
+    }
+
+    private Map<String, AttributeValue> outbox(UUID id) {
+        return client.getItem(b -> b.tableName(outboxTable)
+                .key(Map.of("eventId", AttributeValue.fromS(id.toString()))).consistentRead(true)).item();
     }
 
     private boolean attempt(CountDownLatch start, UUID osId) throws InterruptedException {
