@@ -2,6 +2,14 @@
 
 Este arquivo descreve como gerar evidência local; resultados de AWS, EKS, SonarCloud e GitHub precisam ser capturados no ambiente de entrega.
 
+## Resultado observado em 11/11/2026 (ambiente local)
+
+- `./mvnw.cmd -q verify` passou nesta revisão: **26 testes**, zero falhas, erros ou skips; JaCoCo cobriu **4.057 de 4.962 instruções (81,76%)**, com o gate de 80% aprovado.
+- O roteiro completo passou com LocalStack 4.9.2 e catálogo OS simulado em `localhost:8099`: `PASS osId=443ac62a-5c59-4596-b6d3-e9b7b554d2df pecaId=2c610dd5-8e6c-4391-b809-a78b6184ea76`. Foram conferidos prestação, alocação, conclusão do diagnóstico, reserva, recusa, início e finalização, além de liberação em outra OS.
+- A execução do roteiro revelou que `GET /execucoes/{osId}` falhava após a transição de estado. O modelo e o repositório foram corrigidos, e um teste de regressão cobre consultas nos estados `EM_EXECUCAO` e `FINALIZADA`.
+
+A conclusão da execução foi demonstrada no serviço isolado. O comando `IniciarExecucao` ainda confirma estoque e altera a ordem em operações separadas; esta evidência não comprova atomicidade desse pivô nem o fluxo entre microsserviços reais.
+
 ## Resultado observado em 10/11/2026 (ambiente local)
 
 - `./mvnw.cmd verify` passou com Docker Desktop e LocalStack ativos após a integração do cadastro de peças (base integrada `acd7387`): 25 testes, zero falhas, erros ou skips; JaCoCo 4.036 instruções cobertas e 910 não cobertas, **81,60%**, com `jacoco:check` aprovado. O HTML é gerado em `target/site/jacoco/index.html` no checkout usado para a verificação. O CI deve repetir a verificação no SHA final.
@@ -22,11 +30,12 @@ O gate de 80% está no `pom.xml`. Não substitua sua evidência por percentuais 
 ## Demonstração local
 
 1. Na raiz do repositório, em PowerShell, execute `. .\scripts\setup-localstack.ps1` para iniciar LocalStack e manter as variáveis de ambiente na sessão.
-2. Na mesma sessão, execute `.\mvnw.cmd spring-boot:run` e aguarde `GET http://localhost:8080/actuator/health` responder `UP`.
-3. Em outra sessão, execute `.\scripts\demo-localstack.ps1`. O script cria IDs novos, envia duas cópias de `AbrirDiagnostico`, cadastra uma peça em `POST /pecas`, reserva a última unidade, verifica a recusa para uma segunda OS, libera a reserva, consulta o estoque por REST e recebe os eventos na fila assinante de SNS.
-4. Guarde a linha `PASS` com `osId` e `pecaId`, a resposta `GET /execucoes/{osId}`, a marca de idempotência consultada por `messageId` e o estado do estoque. O script falha caso algum desses passos não aconteça.
+2. Em outra sessão, execute `pwsh -File .\scripts\mock-os-catalogo.ps1`. Ele responde localmente a `GET /servicos/{id}` para a inclusão da prestação; encerre com Ctrl+C após a demonstração.
+3. Na sessão do setup, execute `.\mvnw.cmd spring-boot:run` e aguarde `GET http://localhost:8080/actuator/health` responder `UP`.
+4. Em uma terceira sessão, execute `.\scripts\demo-localstack.ps1`. O script cria IDs novos, envia duas cópias de `AbrirDiagnostico`, inclui prestação com o catálogo local, cadastra e aloca peça, conclui diagnóstico, reserva a última unidade, verifica recusa em outra OS, inicia e finaliza a execução, e libera uma reserva separada. Também confere eventos na fila assinante de SNS.
+5. Guarde a linha `PASS` com `osId` e `pecaId`, a resposta `GET /execucoes/{osId}`, a marca de idempotência consultada por `messageId` e o estado do estoque. O script falha caso algum desses passos não aconteça.
 
-O roteiro utiliza apenas credenciais de teste e endpoint `localhost:4566`; não configura nem modifica uma conta AWS. Ele demonstra um serviço isolado com uma fila de respostas simulando o OS, não a Saga completa entre os quatro serviços. A chamada REST ao catálogo do OS para incluir uma prestação requer o OS disponível e `EXECUCAO_OS_BASE_URL` configurada.
+O roteiro utiliza apenas credenciais de teste e endpoint `localhost:4566`; não configura nem modifica uma conta AWS. O catálogo OS é simulado por um servidor HTTP restrito a localhost. Ele demonstra o serviço Execução isolado com uma fila de respostas simulando o OS, não a Saga completa entre os quatro serviços nem a integração real com o catálogo OS.
 
 ## Contrato e arquitetura
 

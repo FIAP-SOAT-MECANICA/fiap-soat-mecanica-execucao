@@ -7,6 +7,7 @@ $env:AWS_SESSION_TOKEN = ''
 $env:AWS_REGION = 'us-east-1'
 $env:AWS_DEFAULT_REGION = 'us-east-1'
 $env:AWS_ENDPOINT = 'http://localhost:4566'
+$env:EXECUCAO_OS_BASE_URL = 'http://localhost:8099'
 $endpoint = $env:AWS_ENDPOINT
 
 function Invoke-LocalAws {
@@ -72,6 +73,7 @@ if (-not ($subscriptions -like "*$responseArn*")) {
         '--attributes', 'RawMessageDelivery=true') | Out-Null
 }
 Write-Host 'LocalStack resources are ready. Environment variables are set in this PowerShell session.'
+Write-Host 'In another shell start the local catalog: pwsh -File .\scripts\mock-os-catalogo.ps1'
 Write-Host 'Start the service here: .\mvnw.cmd spring-boot:run'
 Write-Host 'Then run in another shell: .\scripts\demo-localstack.ps1'
 Write-Host "Command queue: $env:EXECUCAO_COMMAND_QUEUE_URL"

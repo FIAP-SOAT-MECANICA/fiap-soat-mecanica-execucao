@@ -37,6 +37,8 @@ class DynamoDiagnosticoRepository implements DiagnosticoRepository {
     }
 
     @Override public boolean abrirSeAusente(OrdemDiagnostico ordem, UUID commandId, MessageEnvelope event) {
+        if (!"EM_DIAGNOSTICO".equals(ordem.status()))
+            throw new IllegalArgumentException("Estado inicial inválido");
         Map<String, AttributeValue> order = new HashMap<>();
         order.put("osId", s(ordem.osId().toString()));
         order.put("sagaId", s(ordem.sagaId().toString()));

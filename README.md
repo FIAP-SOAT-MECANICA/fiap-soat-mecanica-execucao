@@ -18,7 +18,7 @@ flowchart LR
 
 Java 21 e Maven Wrapper: `./mvnw.cmd verify` no Windows ou `./mvnw verify` no Linux. Configure `AWS_REGION`, `EXECUCAO_ORDENS_TABLE`, `EXECUCAO_IDEMPOTENCIA_TABLE`, `EXECUCAO_OUTBOX_TABLE`, `EXECUCAO_PECAS_TABLE`, `EXECUCAO_RESERVAS_TABLE`, `EXECUCAO_COMMAND_QUEUE_URL` e `EXECUCAO_EVENT_TOPIC_ARN`. Para LocalStack, defina `AWS_ENDPOINT` e credenciais de teste. Para construir a imagem, rode `./mvnw.cmd package` e `docker build -t mecanica-execucao .`.
 
-No Windows, com Docker Desktop e AWS CLI instalados, execute `. .\scripts\setup-localstack.ps1` a partir da raiz do repositório. Na mesma sessão, rode `.\mvnw.cmd spring-boot:run`. Em outra sessão, execute `.\scripts\demo-localstack.ps1`. O script reproduz abertura idempotente de diagnóstico, reserva e eventos entregues à fila de respostas simulada. Veja [o roteiro e as evidências](docs/evidencias-f6.md).
+No Windows, com Docker Desktop, PowerShell 7 e AWS CLI instalados, execute `. .\scripts\setup-localstack.ps1` a partir da raiz do repositório. Em outra sessão, inicie o catálogo local com `pwsh -File .\scripts\mock-os-catalogo.ps1`. Na sessão de setup, rode `.\mvnw.cmd spring-boot:run`. Em uma terceira sessão, execute `.\scripts\demo-localstack.ps1`. O script percorre diagnóstico, prestação, peça, reserva, início e finalização, além de recusa e liberação em ordens separadas. Veja [o roteiro e as evidências](docs/evidencias-f6.md).
 
 O endpoint `GET /actuator/health` verifica a aplicação; `GET /execucoes/{osId}` consulta o diagnóstico. O contrato REST gerado está em `GET /v3/api-docs` e pode ser explorado em `GET /swagger-ui.html`. A fila de comandos deve ser padrão e ter DLQ; a assinatura do tópico na fila de respostas da Saga deve usar entrega bruta.
 
