@@ -39,7 +39,7 @@ class EstoqueCommandHandler {
                 || !command.osId().toString().equals(command.payload().path("osId").asText())) {
             throw new IllegalArgumentException("Comando de estoque inválido");
         }
-        String eventType;
+        if (!"IniciarExecucao".equals(command.type()) && estoque.jaProcessado(command.messageId())) return;
         Map<UUID, Integer> faltantes = Map.of();
         switch (command.type()) {
             case "ReservarPecas" -> {
@@ -48,21 +48,27 @@ class EstoqueCommandHandler {
                 if (!itens.isArray() || itens.isEmpty()) throw new IllegalArgumentException("Peças ausentes");
                 for (var item : itens) {
                     UUID pecaId = UUID.fromString(item.path("pecaId").asText());
-                    int quantidade = item.path("qtd").asInt(0);
+                    if (!item.path("qtd").isIntegralNumber() || !item.path("qtd").canConvertToInt())
+                        throw new IllegalArgumentException("Quantidade deve ser inteira");
+                    int quantidade = item.path("qtd").intValue();
                     if (quantidade <= 0 || pecas.putIfAbsent(pecaId, quantidade) != null)
                         throw new IllegalArgumentException("Peça ou quantidade inválida");
                 }
                 try {
-                    estoque.reservar(command.osId(), pecas);
-                    eventType = "PecasReservadas";
+                    estoque.reservar(command.osId(), pecas, event(command, "PecasReservadas",
+                            mapper.createObjectNode().put("osId", command.osId().toString())));
                 } catch (EstoqueSemDisponibilidadeException e) {
-                    eventType = "ReservaPecasRecusada";
                     faltantes = e.faltantes();
+                    ObjectNode payload = mapper.createObjectNode().put("osId", command.osId().toString());
+                    var array = payload.putArray("faltantes");
+                    faltantes.forEach((pecaId, quantidade) -> array.addObject()
+                            .put("pecaId", pecaId.toString()).put("qtd", quantidade));
+                    estoque.registrarResultado(event(command, "ReservaPecasRecusada", payload));
                 }
             }
             case "LiberarReservaPecas" -> {
-                estoque.liberar(command.osId());
-                eventType = "ReservaPecasLiberada";
+                estoque.liberar(command.osId(), event(command, "ReservaPecasLiberada",
+                        mapper.createObjectNode().put("osId", command.osId().toString())));
             }
             case "IniciarExecucao" -> {
                 estoque.confirmar(command.osId());
@@ -71,15 +77,12 @@ class EstoqueCommandHandler {
             }
             default -> throw new IllegalArgumentException("Comando de estoque desconhecido");
         }
-        ObjectNode payload = mapper.createObjectNode().put("osId", command.osId().toString());
-        if ("ReservaPecasRecusada".equals(eventType)) {
-            var array = payload.putArray("faltantes");
-            faltantes.forEach((pecaId, quantidade) -> array.addObject()
-                    .put("pecaId", pecaId.toString()).put("qtd", quantidade));
-        }
+    }
+
+    private MessageEnvelope event(MessageEnvelope command, String eventType, ObjectNode payload) {
         UUID eventId = UUID.nameUUIDFromBytes((command.messageId() + ":" + eventType)
                 .getBytes(StandardCharsets.UTF_8));
-        outbox.registrar(new MessageEnvelope(eventId, eventType, 1, command.sagaId(), command.osId(),
-                command.correlationId(), command.messageId(), clock.instant(), payload));
+        return new MessageEnvelope(eventId, eventType, 1, command.sagaId(), command.osId(),
+                command.correlationId(), command.messageId(), clock.instant(), payload);
     }
 }

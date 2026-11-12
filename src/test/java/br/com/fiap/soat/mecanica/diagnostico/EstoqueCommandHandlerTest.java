@@ -27,10 +27,10 @@ class EstoqueCommandHandlerTest {
 
     @Test void indisponibilidadeEmiteRecusaComFaltantes() {
         doThrow(new EstoqueSemDisponibilidadeException("sem estoque", Map.of(pecaId, 1), null))
-                .when(estoque).reservar(eq(osId), anyMap());
+                .when(estoque).reservar(eq(osId), anyMap(), any());
         handler.executar(reservar());
         ArgumentCaptor<MessageEnvelope> captor = ArgumentCaptor.forClass(MessageEnvelope.class);
-        verify(outbox).registrar(captor.capture());
+        verify(estoque).registrarResultado(captor.capture());
         assertEquals("ReservaPecasRecusada", captor.getValue().type());
         assertEquals(pecaId.toString(), captor.getValue().payload().path("faltantes").get(0).path("pecaId").asText());
         assertEquals(1, captor.getValue().payload().path("faltantes").get(0).path("qtd").asInt());
@@ -38,8 +38,26 @@ class EstoqueCommandHandlerTest {
 
     @Test void conflitoTransitorioNaoEmiteRecusa() {
         doThrow(new EstoqueConflitoTransitorioException("conflito", null))
-                .when(estoque).reservar(eq(osId), anyMap());
+                .when(estoque).reservar(eq(osId), anyMap(), any());
         assertThrows(EstoqueConflitoTransitorioException.class, () -> handler.executar(reservar()));
+        verifyNoInteractions(outbox);
+    }
+
+    @Test void reservaEntregaEventoParaTransacaoSemGravacaoSeparada() {
+        handler.executar(reservar());
+        ArgumentCaptor<MessageEnvelope> event = ArgumentCaptor.forClass(MessageEnvelope.class);
+        verify(estoque).reservar(eq(osId), eq(Map.of(pecaId, 2)), event.capture());
+        assertEquals("PecasReservadas", event.getValue().type());
+        verifyNoInteractions(outbox);
+    }
+
+    @Test void quantidadeFracionariaERejeitada() {
+        var command = reservar();
+        ((com.fasterxml.jackson.databind.node.ObjectNode) command.payload().path("pecas").get(0))
+                .put("qtd", 1.5);
+        assertThrows(IllegalArgumentException.class, () -> handler.executar(command));
+        verify(estoque).jaProcessado(command.messageId());
+        verifyNoMoreInteractions(estoque);
         verifyNoInteractions(outbox);
     }
 

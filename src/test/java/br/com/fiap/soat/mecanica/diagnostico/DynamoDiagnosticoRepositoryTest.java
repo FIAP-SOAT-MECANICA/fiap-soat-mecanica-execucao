@@ -63,6 +63,26 @@ class DynamoDiagnosticoRepositoryTest {
         assertThrows(IllegalStateException.class, () -> repo.abrirSeAusente(order(), UUID.randomUUID(), event()));
     }
 
+    @Test void consultaOrdemEmExecucaoEAberturaExigeEstadoInicial() {
+        when(dynamo.getItem(any(software.amazon.awssdk.services.dynamodb.model.GetItemRequest.class)))
+                .thenReturn(GetItemResponse.builder().item(Map.of(
+                        "osId", s(osId.toString()), "sagaId", s(sagaId.toString()),
+                        "veiculoId", s(veiculoId.toString()), "placa", s("ABC1D23"),
+                        "abertaEm", s(now.toString()), "status", s("EM_EXECUCAO"))).build());
+        assertEquals("EM_EXECUCAO", repo.buscar(osId).orElseThrow().status());
+        when(dynamo.getItem(any(software.amazon.awssdk.services.dynamodb.model.GetItemRequest.class)))
+                .thenReturn(GetItemResponse.builder().item(Map.of(
+                        "osId", s(osId.toString()), "sagaId", s(sagaId.toString()),
+                        "veiculoId", s(veiculoId.toString()), "placa", s("ABC1D23"),
+                        "abertaEm", s(now.toString()), "status", s("FINALIZADA"))).build());
+        assertEquals("FINALIZADA", repo.buscar(osId).orElseThrow().status());
+        assertThrows(IllegalArgumentException.class, () -> new OrdemDiagnostico(
+                osId, sagaId, veiculoId, "ABC1D23", now, null));
+        assertThrows(IllegalArgumentException.class, () -> repo.abrirSeAusente(
+                new OrdemDiagnostico(osId, sagaId, veiculoId, "ABC1D23", now, "FINALIZADA"),
+                UUID.randomUUID(), event()));
+    }
+
     private OrdemDiagnostico order() {
         return new OrdemDiagnostico(osId, sagaId, veiculoId, "ABC1D23", now, "EM_DIAGNOSTICO");
     }

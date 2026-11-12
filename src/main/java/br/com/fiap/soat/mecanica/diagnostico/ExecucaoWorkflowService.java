@@ -81,6 +81,8 @@ public class ExecucaoWorkflowService {
         var piece = dynamo.getItem(GetItemRequest.builder().tableName(pecasTable)
                 .key(Map.of("pecaId", s(pecaId.toString()))).consistentRead(true).build()).item();
         if (piece == null || piece.isEmpty()) throw new IllegalArgumentException("Peça não encontrada");
+        if (piece.containsKey("ativo") && Boolean.FALSE.equals(piece.get("ativo").bool()))
+            throw new IllegalArgumentException("Peça inativa");
         String valorUnit = scalar(piece, "valorUnitario");
         if (valorUnit == null || new BigDecimal(valorUnit).signum() < 0)
             throw new IllegalStateException("Peça sem valor unitário válido");
