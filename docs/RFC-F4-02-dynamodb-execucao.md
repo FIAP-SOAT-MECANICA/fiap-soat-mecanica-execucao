@@ -10,8 +10,8 @@ Execução é dona dos diagnósticos, prestações, peças e reservas. Cada OS �
 | --- | --- | --- |
 | `execucao-ordens` | `osId` (S) | Diagnóstico, estado, prestações aninhadas, versão; consulta direta por OS. |
 | `execucao-pecas` | `pecaId` (S) | Cadastro, `valorUnitario`, `qtdEstoque`, `qtdDisponivel`, `qtdReservada`; operações condicionais por peça. |
-| `execucao-reservas` | `osId` (S), `pecaId` (S) | Quantidade reservada por OS e peça; consulta das reservas da OS para confirmar ou liberar. |
-| `execucao-idempotencia` | `messageId` (S) | Deduplicação de `AbrirDiagnostico` e dos comandos de reservar/liberar peças; `expiresAt` é TTL para marcadores de diagnóstico, enquanto os marcadores de estoque duráveis não expiram. |
+| `execucao-reservas` | `osId` (S), `pecaId` (S) | Quantidade e `cycleId` por OS e peça; item sentinela `pecaId=__CYCLE__` guarda o ciclo atual e serializa novas reservas. |
+| `execucao-idempotencia` | `messageId` (S) | Deduplicação de comandos e tombstones `cycle:<osId>:<cycleId>`; `expiresAt` é TTL apenas para marcadores de diagnóstico. Marcadores de estoque e tombstones não expiram. |
 | `execucao-outbox` | `eventId` (S) | Envelope de evento pendente para SNS. |
 
 `execucao-ordens` possui o GSI esparso `fila` com `filaStatus` como partição e `filaOrdem` como ordenação, projeção `ALL`. A chave de ordenação codifica prioridade, instante UTC e `osId`, mantendo ordem estável. Itens que saem da fila perdem os atributos do índice. `GET /execucoes/fila` lê esse GSI com cursor; `GET /execucoes/tempo-medio` calcula tempos a partir das ordens concluídas.
@@ -19,15 +19,19 @@ Execução é dona dos diagnósticos, prestações, peças e reservas. Cada OS �
 ## Invariantes e transações
 
 - A abertura de diagnóstico escreve ordem, marca de idempotência e evento `DiagnosticoAberto` em uma transação. Repetir o mesmo `messageId` não cria outra ordem.
-- A reserva de peças usa `TransactWriteItems` com condições sobre disponibilidade e registros de reserva. Na mesma transação entram mutação dos contadores, marca durável de `messageId` e evento de outbox. Se uma peça estiver indisponível, a operação inteira falha; nenhuma peça é reservada parcialmente. A recusa permanente grava `ReservaPecasRecusada` e sua marca na mesma transação.
-- Confirmar a reserva baixa o estoque; liberar devolve a disponibilidade. Liberação, marca de `messageId` e outbox são atômicas. Uma repetição do mesmo comando após a publicação do evento não produz outro efeito.
+- A reserva de peças usa `TransactWriteItems` com condições sobre disponibilidade e registros de reserva. Na mesma transação entram os contadores, a sentinela do ciclo, um tombstone durável do `cycleId`, a marca de `messageId` e a outbox. Uma recusa permanente grava `ReservaPecasRecusada`, sua marca e o tombstone em uma transação; para tentar novamente após reposição de estoque, o OS deve criar outro `cycleId`.
+- `IniciarExecucao` confirma o estoque e as reservas, marca a sentinela como confirmada, altera a ordem por versão otimista e grava o marcador do comando e `ExecucaoIniciada` em uma única transação. Uma falha em qualquer ação reverte todas. A liberação devolve a disponibilidade com marca de `messageId` e outbox na mesma transação.
 - Alterações de prestação e diagnóstico usam versão otimista do item de ordem. Concluir o diagnóstico e finalizar a última prestação gravam a mudança de estado e o respectivo evento na mesma transação.
 - O publicador envia os itens pendentes da outbox ao SNS e então os remove. A janela entre publicação e remoção permite entrega duplicada; consumidores precisam deduplicar por `messageId`.
 
-Há duas limitações de integração ainda abertas: `IniciarExecucao` confirma o estoque e inicia a ordem em operações separadas, então uma falha entre elas requer recuperação idempotente; e uma nova reserva para a mesma OS depois de `LiberarReservaPecas` (revisão de orçamento) não está garantida pelo desenho atual da chave `osId`/`pecaId`. Esses fluxos precisam de ajuste e teste entre OS e Execução antes de considerar a Saga completa.
+## Contrato de ciclos com o OS
+
+O produtor de comandos no OS deve incluir `payload.cycleId` como UUID estável em `ReservarPecas`, `LiberarReservaPecas` e `IniciarExecucao`. Uma revisão do orçamento após liberação cria um UUID novo e envia `payload.expectedPreviousCycleId` em `ReservarPecas`, igual ao ciclo liberado (UUID ou `LEGACY` para o primeiro ciclo legado). O serviço compara esse predecessor com a sentinela dentro da transação. Assim, um comando antigo nunca entregue não pode iniciar um ciclo depois de uma revisão mais recente. O `sagaId` do envelope continua identificando a Saga; ele não substitui o `cycleId`. Mensagens sem `cycleId` continuam compatíveis apenas com um primeiro ciclo legado. Após iniciar um ciclo com ID, um comando legado não pode confirmar ou liberar esse estoque. Os eventos de resposta incluem `cycleId` no payload quando o comando o inclui.
+
+O serviço OS ainda não publica esse campo no fluxo integrado; a alteração do produtor, o contrato compartilhado e o teste ponta a ponta continuam pendentes. A implementação local também pressupõe que uma execução com `IniciarExecucao` possui ao menos uma peça reservada; o caso de prestação apenas com mão de obra requer fluxo próprio.
 
 O DynamoDB impõe limite de tamanho por item e por transação. Diagnósticos com muitas prestações ou alocações exigirão medição e eventual divisão do agregado. O lookup de prestação e alocação por ID usa scan paginado na implementação atual; um índice dedicado será necessário com maior volume. O GSI da fila tem consistência eventual, portanto uma mudança de prioridade pode demorar a aparecer na listagem.
-Cada peça reservada ocupa duas ações de transação (contador e registro de reserva); marca e outbox ocupam mais duas. O limite de 100 ações do DynamoDB deixa, portanto, no máximo 49 peças distintas em uma reserva.
+Cada peça reservada ocupa duas ações de transação (contador e registro de reserva). Reserva acrescenta sentinela, tombstone, marcador e outbox; início acrescenta ordem, sentinela, marcador e outbox. O limite de 100 ações do DynamoDB permite até 48 peças distintas por ciclo.
 
 ## Alternativas e consequências
 

@@ -45,6 +45,7 @@ class DynamoEstoqueRepositoryTest {
     private EstoqueService service;
     private UUID pecaId;
     private String outboxTable;
+    private String reservasTable;
     private String idempotenciaTable;
     private PecaRepository pecas;
 
@@ -59,6 +60,7 @@ class DynamoEstoqueRepositoryTest {
         String suffix = UUID.randomUUID().toString().replace("-", "");
         String pecasTable = "pecas" + suffix;
         String reservasTable = "reservas" + suffix;
+        this.reservasTable = reservasTable;
         outboxTable = "outbox" + suffix;
         idempotenciaTable = "idem" + suffix;
         createTable(pecasTable, "pecaId", null);
@@ -169,14 +171,76 @@ class DynamoEstoqueRepositoryTest {
     @Test
     void recusaTemMarcadorDuravelAposPublicacaoDoEvento() {
         var event = event(UUID.randomUUID(), "ReservaPecasRecusada");
-        service.registrarResultado(event);
+        UUID cycle = UUID.randomUUID();
+        service.registrarRecusa(event, cycle);
         assertEquals(true, service.jaProcessado(event.causationId()));
         client.deleteItem(b -> b.tableName(outboxTable)
                 .key(Map.of("eventId", AttributeValue.fromS(event.messageId().toString()))));
-        service.registrarResultado(event);
+        service.registrarRecusa(event, cycle);
         assertEquals(true, outbox(event.messageId()).isEmpty());
-        service.reservar(event.osId(), Map.of(pecaId, 1), event);
+        service.reservar(event.osId(), Map.of(pecaId, 1), cycle, event);
         assertEquals("1", piece().get("qtdDisponivel").n());
+        assertThrows(EstoqueException.class, () -> service.reservar(event.osId(),
+                Map.of(pecaId, 1), cycle, event(event.osId(), "PecasReservadas")));
+    }
+
+    @Test
+    void novoCicloAposLiberacaoRejeitaComandosAntigosMesmoDepoisDeOutraLiberacao() {
+        UUID osId = UUID.randomUUID();
+        UUID first = UUID.randomUUID(), second = UUID.randomUUID(), third = UUID.randomUUID();
+        service.reservar(osId, Map.of(pecaId, 1), first, event(osId, "PecasReservadas"));
+        service.liberar(osId, first, event(osId, "ReservaPecasLiberada"));
+        service.reservar(osId, Map.of(pecaId, 1), second, first.toString(),
+                event(osId, "PecasReservadas"));
+        assertThrows(EstoqueException.class, () -> service.liberar(osId, first,
+                event(osId, "ReservaPecasLiberada")));
+        assertThrows(EstoqueException.class, () -> service.liberar(osId, null,
+                event(osId, "ReservaPecasLiberada")));
+        assertEquals("0", piece().get("qtdDisponivel").n());
+        service.liberar(osId, second, event(osId, "ReservaPecasLiberada"));
+        assertThrows(EstoqueException.class, () -> service.reservar(osId, Map.of(pecaId, 1),
+                UUID.randomUUID(), null, event(osId, "PecasReservadas")));
+        assertThrows(EstoqueException.class, () -> service.reservar(osId, Map.of(pecaId, 1),
+                UUID.randomUUID(), first.toString(), event(osId, "PecasReservadas")));
+        assertThrows(EstoqueException.class, () -> service.reservar(osId, Map.of(pecaId, 1), first,
+                event(osId, "PecasReservadas")));
+        service.reservar(osId, Map.of(pecaId, 1), third, second.toString(),
+                event(osId, "PecasReservadas"));
+        assertEquals("0", piece().get("qtdDisponivel").n());
+    }
+
+    @Test
+    void doisNovosCiclosDaMesmaOsNaoReservamPecasDistintasSimultaneamente() throws Exception {
+        UUID osId = UUID.randomUUID();
+        service.reservar(osId, Map.of(pecaId, 1), UUID.randomUUID(), event(osId, "PecasReservadas"));
+        UUID initial = UUID.fromString(client.getItem(b -> b.tableName(reservasTable)
+                .key(Map.of("osId", AttributeValue.fromS(osId.toString()),
+                        "pecaId", AttributeValue.fromS("__CYCLE__"))).consistentRead(true))
+                .item().get("cycleId").s());
+        service.liberar(osId, initial, event(osId, "ReservaPecasLiberada"));
+        UUID another = UUID.randomUUID();
+        client.putItem(b -> b.tableName(pecasTable).item(Map.of(
+                "pecaId", AttributeValue.fromS(another.toString()),
+                "qtdEstoque", AttributeValue.fromN("1"),
+                "qtdDisponivel", AttributeValue.fromN("1"),
+                "qtdReservada", AttributeValue.fromN("0"))));
+        CountDownLatch start = new CountDownLatch(1);
+        try (var pool = Executors.newFixedThreadPool(2)) {
+            Future<Boolean> one = pool.submit(() -> cycleAttempt(start, osId, pecaId, initial));
+            Future<Boolean> two = pool.submit(() -> cycleAttempt(start, osId, another, initial));
+            start.countDown();
+            assertEquals(1, (one.get() ? 1 : 0) + (two.get() ? 1 : 0));
+        }
+    }
+
+    private boolean cycleAttempt(CountDownLatch start, UUID osId, UUID id,
+            UUID cyclePredecessor) throws InterruptedException {
+        start.await();
+        try {
+            service.reservar(osId, Map.of(id, 1), UUID.randomUUID(), cyclePredecessor.toString(),
+                    event(osId, "PecasReservadas"));
+            return true;
+        } catch (EstoqueException expected) { return false; }
     }
 
     @Test

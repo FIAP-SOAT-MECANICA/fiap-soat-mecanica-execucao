@@ -2,13 +2,19 @@
 
 Este arquivo descreve como gerar evidência local; resultados de AWS, EKS, SonarCloud e GitHub precisam ser capturados no ambiente de entrega.
 
+## Revisão de atomicidade e ciclos (14/11/2026)
+
+O código da revisão reúne confirmação de estoque, transição da ordem, marcador de `messageId` e evento `ExecucaoIniciada` em uma transação DynamoDB. Os testes LocalStack adicionados exercitam rollback por conflito da outbox, reentrega após publicação, concorrência entre ciclos e rejeição de comandos atrasados. O roteiro local também envia `cycleId` e `expectedPreviousCycleId` na re-reserva.
+
+Nesta revisão, `test-compile` e os testes unitários sem contêiner passaram. A verificação completa final ainda depende de Docker/CI; o daemon local respondeu com erro 500 antes da execução final. O resultado local anterior de 11/11 abaixo pertence à versão anterior à revisão de ciclos e não comprova este commit.
+
 ## Resultado observado em 11/11/2026 (ambiente local)
 
 - `./mvnw.cmd -q verify` passou nesta revisão: **26 testes**, zero falhas, erros ou skips; JaCoCo cobriu **4.057 de 4.962 instruções (81,76%)**, com o gate de 80% aprovado.
 - O roteiro completo passou com LocalStack 4.9.2 e catálogo OS simulado em `localhost:8099`: `PASS osId=443ac62a-5c59-4596-b6d3-e9b7b554d2df pecaId=2c610dd5-8e6c-4391-b809-a78b6184ea76`. Foram conferidos prestação, alocação, conclusão do diagnóstico, reserva, recusa, início e finalização, além de liberação em outra OS.
 - A execução do roteiro revelou que `GET /execucoes/{osId}` falhava após a transição de estado. O modelo e o repositório foram corrigidos, e um teste de regressão cobre consultas nos estados `EM_EXECUCAO` e `FINALIZADA`.
 
-A conclusão da execução foi demonstrada no serviço isolado. O comando `IniciarExecucao` ainda confirma estoque e altera a ordem em operações separadas; esta evidência não comprova atomicidade desse pivô nem o fluxo entre microsserviços reais.
+A conclusão da execução foi demonstrada no serviço isolado. Os testes posteriores de transação atômica e ciclos são descritos abaixo. Esta evidência local não comprova o fluxo entre microsserviços reais.
 
 ## Resultado observado em 10/11/2026 (ambiente local)
 

@@ -9,6 +9,7 @@ public interface EstoqueRepository {
     void liberar(UUID osId);
     void reservar(ReservaEstoque reserva, MessageEnvelope event);
     void liberar(UUID osId, MessageEnvelope event);
+    void liberar(UUID osId, UUID cycleId, MessageEnvelope event);
     boolean jaProcessado(UUID messageId);
-    void registrarResultado(MessageEnvelope event);
+    void registrarRecusa(MessageEnvelope event, UUID cycleId);
 }

@@ -27,10 +27,10 @@ class EstoqueCommandHandlerTest {
 
     @Test void indisponibilidadeEmiteRecusaComFaltantes() {
         doThrow(new EstoqueSemDisponibilidadeException("sem estoque", Map.of(pecaId, 1), null))
-                .when(estoque).reservar(eq(osId), anyMap(), any());
+                .when(estoque).reservar(eq(osId), anyMap(), isNull(), isNull(), any());
         handler.executar(reservar());
         ArgumentCaptor<MessageEnvelope> captor = ArgumentCaptor.forClass(MessageEnvelope.class);
-        verify(estoque).registrarResultado(captor.capture());
+        verify(estoque).registrarRecusa(captor.capture(), isNull());
         assertEquals("ReservaPecasRecusada", captor.getValue().type());
         assertEquals(pecaId.toString(), captor.getValue().payload().path("faltantes").get(0).path("pecaId").asText());
         assertEquals(1, captor.getValue().payload().path("faltantes").get(0).path("qtd").asInt());
@@ -38,7 +38,7 @@ class EstoqueCommandHandlerTest {
 
     @Test void conflitoTransitorioNaoEmiteRecusa() {
         doThrow(new EstoqueConflitoTransitorioException("conflito", null))
-                .when(estoque).reservar(eq(osId), anyMap(), any());
+                .when(estoque).reservar(eq(osId), anyMap(), isNull(), isNull(), any());
         assertThrows(EstoqueConflitoTransitorioException.class, () -> handler.executar(reservar()));
         verifyNoInteractions(outbox);
     }
@@ -46,7 +46,7 @@ class EstoqueCommandHandlerTest {
     @Test void reservaEntregaEventoParaTransacaoSemGravacaoSeparada() {
         handler.executar(reservar());
         ArgumentCaptor<MessageEnvelope> event = ArgumentCaptor.forClass(MessageEnvelope.class);
-        verify(estoque).reservar(eq(osId), eq(Map.of(pecaId, 2)), event.capture());
+        verify(estoque).reservar(eq(osId), eq(Map.of(pecaId, 2)), isNull(), isNull(), event.capture());
         assertEquals("PecasReservadas", event.getValue().type());
         verifyNoInteractions(outbox);
     }
@@ -61,15 +61,27 @@ class EstoqueCommandHandlerTest {
         verifyNoInteractions(outbox);
     }
 
+    @Test void novoCicloEncaminhaIdEPredecessorAoEstoque() {
+        var command = reservar();
+        UUID cycleId = UUID.randomUUID(), previousCycleId = UUID.randomUUID();
+        ((com.fasterxml.jackson.databind.node.ObjectNode) command.payload())
+                .put("cycleId", cycleId.toString())
+                .put("expectedPreviousCycleId", previousCycleId.toString());
+        handler.executar(command);
+        ArgumentCaptor<MessageEnvelope> event = ArgumentCaptor.forClass(MessageEnvelope.class);
+        verify(estoque).reservar(eq(osId), eq(Map.of(pecaId, 2)), eq(cycleId),
+                eq(previousCycleId.toString()), event.capture());
+        assertEquals(cycleId.toString(), event.getValue().payload().path("cycleId").asText());
+    }
+
     @Test void iniciarExecucaoConfirmaReservaETransicionaOrdem() {
         var workflow = mock(ExecucaoWorkflowService.class);
         var integrated = new EstoqueCommandHandler(estoque, outbox, mapper, Clock.systemUTC(), workflow);
         var command = new MessageEnvelope(UUID.randomUUID(), "IniciarExecucao", 1, UUID.randomUUID(),
                 osId, "trace", null, Instant.now(), mapper.createObjectNode().put("osId", osId.toString()));
         integrated.executar(command);
-        var sequence = inOrder(estoque, workflow);
-        sequence.verify(estoque).confirmar(osId);
-        sequence.verify(workflow).iniciarExecucao(osId, "trace");
+        verify(workflow).iniciarExecucao(command, null);
+        verify(estoque, never()).confirmar(any());
         verifyNoInteractions(outbox);
     }
 
