@@ -75,7 +75,8 @@ class DiagnosticoLocalStackTest {
                                     "execucao-outbox", mapper)),
                     new EventoOutbox(dynamo, mapper, "execucao-outbox"), mapper, Clock.systemUTC(),
                     new ExecucaoWorkflowService(dynamo, mapper, Clock.systemUTC(), id -> "Serviço",
-                            "execucao-ordens", "execucao-pecas", "execucao-outbox"));
+                            "execucao-ordens", "execucao-pecas", "execucao-outbox",
+                            "execucao-reservas", "execucao-idempotencia"));
             var consumer = new DiagnosticoCommandConsumer(sqs, mapper, useCase, stock, commandQueue);
             var publisher = new DiagnosticoOutboxPublisher(dynamo, sns, "execucao-outbox", topic);
             UUID osId = UUID.randomUUID();

@@ -4,6 +4,7 @@ import br.com.fiap.soat.mecanica.consultas.FilaKey;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.math.BigDecimal;
+import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -19,9 +20,11 @@ import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
 import software.amazon.awssdk.services.dynamodb.model.GetItemRequest;
 import software.amazon.awssdk.services.dynamodb.model.Put;
+import software.amazon.awssdk.services.dynamodb.model.QueryRequest;
 import software.amazon.awssdk.services.dynamodb.model.TransactWriteItem;
 import software.amazon.awssdk.services.dynamodb.model.TransactWriteItemsRequest;
 import software.amazon.awssdk.services.dynamodb.model.TransactionCanceledException;
+import software.amazon.awssdk.services.dynamodb.model.Update;
 
 /** Owns diagnosis and prestation writes on one order item with optimistic locking. */
 @Service
@@ -33,14 +36,19 @@ public class ExecucaoWorkflowService {
     private final String ordensTable;
     private final String pecasTable;
     private final String outboxTable;
+    private final String reservasTable;
+    private final String idempotenciaTable;
 
     public ExecucaoWorkflowService(DynamoDbClient dynamo, ObjectMapper mapper, Clock clock,
             CatalogoServico catalogo,
             @Value("${execucao.diagnostico.ordens-table}") String ordensTable,
             @Value("${execucao.estoque.pecas-table}") String pecasTable,
-            @Value("${execucao.diagnostico.outbox-table}") String outboxTable) {
+            @Value("${execucao.diagnostico.outbox-table}") String outboxTable,
+            @Value("${execucao.estoque.reservas-table}") String reservasTable,
+            @Value("${execucao.diagnostico.idempotencia-table}") String idempotenciaTable) {
         this.dynamo = dynamo; this.mapper = mapper; this.clock = clock; this.catalogo = catalogo;
         this.ordensTable = ordensTable; this.pecasTable = pecasTable; this.outboxTable = outboxTable;
+        this.reservasTable = reservasTable; this.idempotenciaTable = idempotenciaTable;
     }
 
     public Map<String, Object> adicionarPrestacao(UUID osId, UUID servicoId, BigDecimal precoMdo) {
@@ -147,20 +155,114 @@ public class ExecucaoWorkflowService {
         });
     }
 
-    /** Called only after stock reservation confirmation; retry is safe if this write fails. */
-    public Map<String, Object> iniciarExecucao(UUID osId, String correlationId) {
-        return change(osId, order -> {
-            if ("EM_EXECUCAO".equals(str(order, "status"))) return NO_CHANGE;
-            requireStatus(order, "AGUARDANDO_APROVACAO");
-            String now = clock.instant().toString();
-            var prestacoes = prestacoes(order);
-            for (var p : prestacoes) if (active(p)) p.put("dataInicio", s(now));
-            order.put("prestacoes", listMaps(prestacoes));
-            order.put("status", s("EM_EXECUCAO"));
-            order.put("iniciadaEm", s(now));
-            return event(order, "ExecucaoIniciada", correlationId,
-                    mapper.createObjectNode().put("osId", osId.toString()));
-        });
+    /** Confirms the selected reservation cycle, starts the order and records the event atomically. */
+    public Map<String, Object> iniciarExecucao(MessageEnvelope command, UUID cycleId) {
+        UUID osId = command.osId();
+        var original = readOrder(osId);
+        if (!command.sagaId().toString().equals(str(original, "sagaId")))
+            throw new IllegalArgumentException("Saga do comando não corresponde à OS");
+        if (processed(command.messageId())) return view(original);
+        requireStatus(original, "AGUARDANDO_APROVACAO");
+        String cycle = cycleId == null ? "LEGACY" : cycleId.toString();
+        var metaKey = Map.of("osId", s(osId.toString()), "pecaId", s("__CYCLE__"));
+        var meta = dynamo.getItem(GetItemRequest.builder().tableName(reservasTable)
+                .key(metaKey).consistentRead(true).build()).item();
+        if (meta != null && !meta.isEmpty() && !cycle.equals(str(meta, "cycleId")))
+            throw new IllegalStateException("Comando de ciclo de reserva antigo");
+        var pieces = new ArrayList<Map<String, AttributeValue>>();
+        var query = QueryRequest.builder().tableName(reservasTable)
+                .keyConditionExpression("osId = :osId")
+                .expressionAttributeValues(Map.of(":osId", s(osId.toString())))
+                .consistentRead(true).build();
+        for (var page : dynamo.queryPaginator(query)) for (var item : page.items()) {
+            if ("__CYCLE__".equals(str(item, "pecaId"))) continue;
+            String itemCycle = str(item, "cycleId") == null ? "LEGACY" : str(item, "cycleId");
+            if (cycle.equals(itemCycle)) pieces.add(item);
+        }
+        if (pieces.isEmpty() || pieces.size() > 48
+                || pieces.stream().anyMatch(p -> !"RESERVADA".equals(str(p, "estado"))))
+            throw new IllegalStateException("Reserva ativa não encontrada para o ciclo");
+        var updated = new HashMap<>(original);
+        String now = clock.instant().toString();
+        var prestacoes = prestacoes(updated);
+        for (var p : prestacoes) if (active(p)) p.put("dataInicio", s(now));
+        updated.put("prestacoes", listMaps(prestacoes));
+        updated.put("status", s("EM_EXECUCAO"));
+        updated.put("iniciadaEm", s(now));
+        long version = original.containsKey("version") ? Long.parseLong(original.get("version").n()) : 0;
+        updated.put("version", AttributeValue.fromN(Long.toString(version + 1)));
+        updated.remove("filaStatus"); updated.remove("filaOrdem");
+        updated.putAll(FilaKey.attributes("EM_EXECUCAO", str(updated, "abertaEm"), osId));
+        var writes = new ArrayList<TransactWriteItem>();
+        writes.add(TransactWriteItem.builder().put(Put.builder().tableName(ordensTable).item(updated)
+                .conditionExpression("#v = :old OR attribute_not_exists(#v)")
+                .expressionAttributeNames(Map.of("#v", "version"))
+                .expressionAttributeValues(Map.of(":old", AttributeValue.fromN(Long.toString(version))))
+                .build()).build());
+        for (var piece : pieces) {
+            String pecaId = str(piece, "pecaId");
+            int quantity = Integer.parseInt(piece.get("quantidade").n());
+            writes.add(TransactWriteItem.builder().update(Update.builder().tableName(pecasTable)
+                    .key(Map.of("pecaId", s(pecaId)))
+                    .updateExpression("ADD qtdEstoque :minus, qtdReservada :minus")
+                    .conditionExpression("qtdEstoque >= :quantity AND qtdReservada >= :quantity")
+                    .expressionAttributeValues(Map.of(":quantity", AttributeValue.fromN(Integer.toString(quantity)),
+                            ":minus", AttributeValue.fromN(Integer.toString(-quantity))))
+                    .build()).build());
+            String condition = "estado = :reserved AND " + (cycleId == null
+                    ? "(cycleId = :cycle OR attribute_not_exists(cycleId))" : "cycleId = :cycle");
+            writes.add(TransactWriteItem.builder().update(Update.builder().tableName(reservasTable)
+                    .key(Map.of("osId", s(osId.toString()), "pecaId", s(pecaId)))
+                    .updateExpression("SET estado = :confirmed").conditionExpression(condition)
+                    .expressionAttributeValues(Map.of(":reserved", s("RESERVADA"),
+                            ":confirmed", s("CONFIRMADA"), ":cycle", s(cycle))).build()).build());
+        }
+        if (meta == null || meta.isEmpty()) {
+            writes.add(TransactWriteItem.builder().put(Put.builder().tableName(reservasTable)
+                    .item(Map.of("osId", s(osId.toString()), "pecaId", s("__CYCLE__"),
+                            "cycleId", s(cycle), "estado", s("CONFIRMADA")))
+                    .conditionExpression("attribute_not_exists(osId)").build()).build());
+        } else {
+            writes.add(TransactWriteItem.builder().update(Update.builder().tableName(reservasTable)
+                    .key(metaKey).updateExpression("SET estado = :confirmed")
+                    .conditionExpression("cycleId = :cycle AND estado = :reserved")
+                    .expressionAttributeValues(Map.of(":cycle", s(cycle), ":reserved", s("RESERVADA"),
+                            ":confirmed", s("CONFIRMADA"))).build()).build());
+        }
+        writes.add(TransactWriteItem.builder().put(Put.builder().tableName(idempotenciaTable)
+                .item(Map.of("messageId", s(command.messageId().toString()), "osId", s(osId.toString())))
+                .conditionExpression("attribute_not_exists(messageId)").build()).build());
+        var payload = mapper.createObjectNode().put("osId", osId.toString());
+        if (cycleId != null) payload.put("cycleId", cycle);
+        UUID eventId = UUID.nameUUIDFromBytes((command.messageId() + ":ExecucaoIniciada")
+                .getBytes(StandardCharsets.UTF_8));
+        var event = new MessageEnvelope(eventId, "ExecucaoIniciada", 1, command.sagaId(), osId,
+                command.correlationId(), command.messageId(), clock.instant(), payload);
+        try {
+            writes.add(TransactWriteItem.builder().put(Put.builder().tableName(outboxTable)
+                    .item(Map.of("eventId", s(eventId.toString()),
+                            "body", s(mapper.writeValueAsString(event)), "createdAt", s(now)))
+                    .conditionExpression("attribute_not_exists(eventId)").build()).build());
+        } catch (Exception e) { throw new IllegalStateException("Falha ao serializar evento", e); }
+        try { dynamo.transactWriteItems(TransactWriteItemsRequest.builder().transactItems(writes).build()); }
+        catch (TransactionCanceledException e) {
+            if (processed(command.messageId())) return view(readOrder(osId));
+            throw new IllegalStateException("Início da execução conflitou; tente novamente", e);
+        }
+        return view(updated);
+    }
+
+    private Map<String, AttributeValue> readOrder(UUID osId) {
+        var item = dynamo.getItem(GetItemRequest.builder().tableName(ordensTable)
+                .key(Map.of("osId", s(osId.toString()))).consistentRead(true).build()).item();
+        if (item == null || item.isEmpty()) throw new IllegalArgumentException("Execução não encontrada");
+        return item;
+    }
+
+    private boolean processed(UUID messageId) {
+        var item = dynamo.getItem(GetItemRequest.builder().tableName(idempotenciaTable)
+                .key(Map.of("messageId", s(messageId.toString()))).consistentRead(true).build()).item();
+        return item != null && !item.isEmpty();
     }
 
     public Map<String, Object> finalizarPrestacao(UUID prestacaoId, String correlationId) {

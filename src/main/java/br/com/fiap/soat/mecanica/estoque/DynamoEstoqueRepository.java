@@ -13,6 +13,8 @@ import java.util.UUID;
 
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
+import software.amazon.awssdk.services.dynamodb.model.ConditionCheck;
+import software.amazon.awssdk.services.dynamodb.model.GetItemRequest;
 import software.amazon.awssdk.services.dynamodb.model.Put;
 import software.amazon.awssdk.services.dynamodb.model.IdempotentParameterMismatchException;
 import software.amazon.awssdk.services.dynamodb.model.QueryRequest;
@@ -30,6 +32,8 @@ public final class DynamoEstoqueRepository implements EstoqueRepository {
     private static final String RESERVED = "RESERVADA";
     private static final String CONFIRMED = "CONFIRMADA";
     private static final String RELEASED = "LIBERADA";
+    private static final String META = "__CYCLE__";
+    private static final String LEGACY = "LEGACY";
 
     private final DynamoDbClient client;
     private final String pecasTable;
@@ -60,14 +64,29 @@ public final class DynamoEstoqueRepository implements EstoqueRepository {
     @Override
     public void reservar(ReservaEstoque reserva, MessageEnvelope event) {
         if (event != null && jaProcessado(event.causationId())) return;
-        if (event != null && reserva.pecas().size() > 49)
-            throw new IllegalArgumentException("A reserva com evento comporta ate 49 pecas");
+        if (reserva.pecas().size() > (event == null ? 49 : 48))
+            throw new IllegalArgumentException("A reserva excede o limite da transacao");
+        String cycle = cycle(reserva.cycleId());
+        CycleMeta meta = readMeta(reserva.osId());
         List<Reservation> previous = readReservations(reserva.osId());
-        if (!previous.isEmpty()) {
-            checkIdenticalReservation(reserva, previous);
-            if (event != null) registrarResultado(event);
+        List<Reservation> sameCycle = previous.stream().filter(r -> cycle.equals(r.cycle())).toList();
+        if ((meta != null && cycle.equals(meta.cycle()) && RESERVED.equals(meta.state()))
+                || (meta == null && !sameCycle.isEmpty()
+                        && sameCycle.stream().allMatch(r -> RESERVED.equals(r.state())))) {
+            checkIdenticalReservation(reserva, sameCycle);
+            if (event != null) registrarResultadoNoCiclo(event, cycle, RESERVED);
             return;
         }
+        if (LEGACY.equals(cycle) && (meta != null || !previous.isEmpty()))
+            throw new EstoqueException("Novo ciclo de reserva exige cycleId");
+        if (meta == null && (!previous.isEmpty() || reserva.expectedPreviousCycleId() != null))
+            throw new EstoqueException("Ciclo anterior sem marcador; migracao necessaria");
+        if (meta != null && !meta.cycle().equals(reserva.expectedPreviousCycleId()))
+            throw new EstoqueException("expectedPreviousCycleId nao corresponde ao ultimo ciclo");
+        if (meta != null && !RELEASED.equals(meta.state()))
+            throw new EstoqueException("Reserva anterior ainda ativa ou confirmada");
+        if (previous.stream().anyMatch(r -> RESERVED.equals(r.state())))
+            throw new EstoqueException("Reserva anterior ainda ativa");
         List<TransactWriteItem> actions = new ArrayList<>();
         reserva.pecas().entrySet().stream()
                 .sorted(Map.Entry.comparingByKey(Comparator.comparing(UUID::toString)))
@@ -82,37 +101,55 @@ public final class DynamoEstoqueRepository implements EstoqueRepository {
             actions.add(TransactWriteItem.builder().put(Put.builder()
                     .tableName(reservasTable)
                     .item(Map.of("osId", s(reserva.osId()), "pecaId", s(pecaId),
-                            "quantidade", n(qtd), "estado", AttributeValue.fromS(RESERVED)))
-                    .conditionExpression("attribute_not_exists(osId)").build()).build());
+                            "quantidade", n(qtd), "estado", AttributeValue.fromS(RESERVED),
+                            "cycleId", AttributeValue.fromS(cycle)))
+                    .conditionExpression("attribute_not_exists(osId) OR (estado = :liberada AND "
+                            + "(attribute_not_exists(cycleId) OR cycleId <> :cycle))")
+                    .expressionAttributeValues(Map.of(":liberada", AttributeValue.fromS(RELEASED),
+                            ":cycle", AttributeValue.fromS(cycle))).build()).build());
         });
+        actions.add(metaReservationAction(reserva.osId(), cycle, reserva.expectedPreviousCycleId(), meta));
         if (event != null) {
+            actions.add(cycleTombstoneAction(reserva.osId(), cycle));
             actions.add(markerAction(event));
             actions.add(outboxAction(event));
         }
         try {
             transact("reservar", reserva.osId(), actions, event);
         } catch (TransactionCanceledException failure) {
-            List<Reservation> existing = readReservations(reserva.osId());
-            if (existing.isEmpty()) {
-                if (event != null && jaProcessado(event.causationId())) return;
+            if (event != null && jaProcessado(event.causationId())) return;
+            CycleMeta currentMeta = readMeta(reserva.osId());
+            List<Reservation> existing = readReservations(reserva.osId()).stream()
+                    .filter(r -> cycle.equals(r.cycle())).toList();
+            if (currentMeta != null && cycle.equals(currentMeta.cycle())
+                    && RESERVED.equals(currentMeta.state()) && !existing.isEmpty()) {
+                checkIdenticalReservation(reserva, existing);
+                if (event != null) registrarResultadoNoCiclo(event, cycle, RESERVED);
+                return;
+            }
+            if ((currentMeta != null && !cycle.equals(currentMeta.cycle())
+                    && (!RELEASED.equals(currentMeta.state())
+                            || !currentMeta.cycle().equals(reserva.expectedPreviousCycleId())))
+                    || cycleUsed(reserva.osId(), cycle))
+                throw new EstoqueException("Ciclo de reserva ja utilizado ou alterado", failure);
+            if (currentMeta == null || !cycle.equals(currentMeta.cycle()) || existing.isEmpty()) {
                 boolean transientConflict = failure.cancellationReasons().stream()
                         .anyMatch(reason -> "TransactionConflict".equals(reason.code()));
                 if (transientConflict) {
                     throw new EstoqueConflitoTransitorioException(
                             "Conflito transitorio de reserva para OS " + reserva.osId(), failure);
                 }
-                boolean noStock = failure.cancellationReasons().stream()
-                        .anyMatch(reason -> "ConditionalCheckFailed".equals(reason.code()));
-                if (noStock) {
+                Map<UUID, Integer> missing = findMissing(reserva);
+                if (!missing.isEmpty()) {
                     throw new EstoqueSemDisponibilidadeException(
                             "Peca ausente ou sem estoque para OS " + reserva.osId(),
-                            findMissing(reserva), failure);
+                            missing, failure);
                 }
                 throw new EstoqueConflitoTransitorioException(
                         "Reserva temporariamente indisponivel para OS " + reserva.osId(), failure);
             }
             checkIdenticalReservation(reserva, existing);
-            if (event != null) registrarResultado(event);
+            if (event != null) registrarResultadoNoCiclo(event, cycle, RESERVED);
         } catch (IdempotentParameterMismatchException failure) {
             throw new EstoqueException("Reserva divergente para OS " + reserva.osId(), failure);
         }
@@ -129,27 +166,37 @@ public final class DynamoEstoqueRepository implements EstoqueRepository {
 
     @Override
     public void confirmar(UUID osId) {
-        changeState(osId, CONFIRMED, null);
+        changeState(osId, CONFIRMED, null, null);
     }
 
     @Override
     public void liberar(UUID osId) {
-        changeState(osId, RELEASED, null);
+        changeState(osId, RELEASED, null, null);
     }
 
     @Override
     public void liberar(UUID osId, MessageEnvelope event) {
-        if (jaProcessado(event.causationId())) return;
-        changeState(osId, RELEASED, event);
+        liberar(osId, null, event);
     }
 
-    private void changeState(UUID osId, String target, MessageEnvelope event) {
-        List<Reservation> reservations = readReservations(osId);
+    @Override
+    public void liberar(UUID osId, UUID cycleId, MessageEnvelope event) {
+        if (jaProcessado(event.causationId())) return;
+        changeState(osId, RELEASED, cycleId, event);
+    }
+
+    private void changeState(UUID osId, String target, UUID cycleId, MessageEnvelope event) {
+        String cycle = cycle(cycleId);
+        CycleMeta meta = readMeta(osId);
+        if (meta != null && !cycle.equals(meta.cycle()))
+            throw new EstoqueException("Comando de ciclo de reserva antigo para OS " + osId);
+        List<Reservation> reservations = readReservations(osId).stream()
+                .filter(r -> cycle.equals(r.cycle())).toList();
         if (reservations.isEmpty()) {
             throw new EstoqueException("Reserva nao encontrada para OS " + osId);
         }
         if (reservations.stream().allMatch(r -> target.equals(r.state()))) {
-            if (event != null) registrarResultado(event);
+            if (event != null) registrarResultadoNoCiclo(event, cycle, target);
             return;
         }
         if (reservations.stream().anyMatch(r -> !RESERVED.equals(r.state()))) {
@@ -174,9 +221,13 @@ public final class DynamoEstoqueRepository implements EstoqueRepository {
             actions.add(TransactWriteItem.builder().update(Update.builder()
                     .tableName(reservasTable).key(reservationKey(osId, reservation.pecaId()))
                     .updateExpression("SET estado = :destino")
-                    .conditionExpression("estado = :reservada")
-                    .expressionAttributeValues(values).build()).build());
+                    .conditionExpression("estado = :reservada AND "
+                            + "(cycleId = :cycle OR (attribute_not_exists(cycleId) AND :cycle = :legacy))")
+                    .expressionAttributeValues(Map.of(":reservada", values.get(":reservada"),
+                            ":destino", values.get(":destino"), ":cycle", AttributeValue.fromS(cycle),
+                            ":legacy", AttributeValue.fromS(LEGACY))).build()).build());
         }
+        actions.add(metaStateAction(osId, cycle, meta, target));
         if (event != null) {
             actions.add(markerAction(event));
             actions.add(outboxAction(event));
@@ -184,13 +235,32 @@ public final class DynamoEstoqueRepository implements EstoqueRepository {
         try {
             transact(target, osId, actions, event);
         } catch (TransactionCanceledException failure) {
-            List<Reservation> current = readReservations(osId);
+            if (event != null && jaProcessado(event.causationId())) return;
+            CycleMeta currentMeta = readMeta(osId);
+            List<Reservation> current = readReservations(osId).stream()
+                    .filter(r -> cycle.equals(r.cycle())).toList();
             if (current.size() != reservations.size()
-                    || current.stream().anyMatch(r -> !target.equals(r.state()))) {
+                    || current.stream().anyMatch(r -> !target.equals(r.state()))
+                    || currentMeta == null || !cycle.equals(currentMeta.cycle())) {
                 throw new EstoqueException("Nao foi possivel finalizar reserva da OS " + osId, failure);
             }
-            if (event != null) registrarResultado(event);
+            if (event != null) registrarResultadoNoCiclo(event, cycle, target);
         }
+    }
+
+    private TransactWriteItem metaStateAction(UUID osId, String cycle, CycleMeta meta, String target) {
+        if (meta == null) {
+            return TransactWriteItem.builder().put(Put.builder().tableName(reservasTable)
+                    .item(Map.of("osId", s(osId), "pecaId", AttributeValue.fromS(META),
+                            "cycleId", AttributeValue.fromS(cycle), "estado", AttributeValue.fromS(target)))
+                    .conditionExpression("attribute_not_exists(osId)").build()).build();
+        }
+        return TransactWriteItem.builder().update(Update.builder().tableName(reservasTable)
+                .key(metaKey(osId)).updateExpression("SET estado = :target")
+                .conditionExpression("cycleId = :cycle AND estado = :reserved")
+                .expressionAttributeValues(Map.of(":target", AttributeValue.fromS(target),
+                        ":cycle", AttributeValue.fromS(cycle),
+                        ":reserved", AttributeValue.fromS(RESERVED))).build()).build();
     }
 
     private TransactWriteItem outboxAction(MessageEnvelope event) {
@@ -215,6 +285,52 @@ public final class DynamoEstoqueRepository implements EstoqueRepository {
                 .conditionExpression("attribute_not_exists(messageId)").build()).build();
     }
 
+    private TransactWriteItem cycleTombstoneAction(UUID osId, String cycle) {
+        if (idempotenciaTable == null) throw new IllegalStateException("Idempotencia nao configurada");
+        return TransactWriteItem.builder().put(Put.builder().tableName(idempotenciaTable)
+                .item(Map.of("messageId", AttributeValue.fromS("cycle:" + osId + ":" + cycle),
+                        "osId", s(osId)))
+                .conditionExpression("attribute_not_exists(messageId)").build()).build();
+    }
+
+    private boolean cycleUsed(UUID osId, String cycle) {
+        if (idempotenciaTable == null) return false;
+        var item = client.getItem(GetItemRequest.builder().tableName(idempotenciaTable)
+                .key(Map.of("messageId", AttributeValue.fromS("cycle:" + osId + ":" + cycle)))
+                .consistentRead(true).build()).item();
+        return item != null && !item.isEmpty();
+    }
+
+    private TransactWriteItem metaReservationAction(UUID osId, String cycle,
+            String expectedPreviousCycleId, CycleMeta prior) {
+        if (prior == null) {
+            return TransactWriteItem.builder().put(Put.builder().tableName(reservasTable)
+                    .item(Map.of("osId", s(osId), "pecaId", AttributeValue.fromS(META),
+                            "cycleId", AttributeValue.fromS(cycle), "estado", AttributeValue.fromS(RESERVED)))
+                    .conditionExpression("attribute_not_exists(osId)").build()).build();
+        }
+        return TransactWriteItem.builder().update(Update.builder().tableName(reservasTable)
+                .key(metaKey(osId)).updateExpression("SET cycleId = :next, estado = :reservada")
+                .conditionExpression("cycleId = :prior AND estado = :liberada")
+                .expressionAttributeValues(Map.of(":next", AttributeValue.fromS(cycle),
+                        ":prior", AttributeValue.fromS(expectedPreviousCycleId),
+                        ":reservada", AttributeValue.fromS(RESERVED),
+                        ":liberada", AttributeValue.fromS(RELEASED))).build()).build();
+    }
+
+    private CycleMeta readMeta(UUID osId) {
+        var item = client.getItem(GetItemRequest.builder().tableName(reservasTable)
+                .key(metaKey(osId)).consistentRead(true).build()).item();
+        return item == null || item.isEmpty() ? null
+                : new CycleMeta(item.get("cycleId").s(), item.get("estado").s());
+    }
+
+    private static Map<String, AttributeValue> metaKey(UUID osId) {
+        return Map.of("osId", s(osId), "pecaId", AttributeValue.fromS(META));
+    }
+
+    private static String cycle(UUID id) { return id == null ? LEGACY : id.toString(); }
+
     @Override
     public boolean jaProcessado(UUID messageId) {
         if (idempotenciaTable == null || messageId == null) return false;
@@ -223,14 +339,36 @@ public final class DynamoEstoqueRepository implements EstoqueRepository {
         return item != null && !item.isEmpty();
     }
 
+    private void registrarResultadoNoCiclo(MessageEnvelope event, String cycle, String state) {
+        if (jaProcessado(event.causationId())) return;
+        CycleMeta meta = readMeta(event.osId());
+        if (meta != null && (!cycle.equals(meta.cycle()) || !state.equals(meta.state())))
+            throw new EstoqueException("Ciclo de reserva alterado antes do evento");
+        var check = ConditionCheck.builder().tableName(reservasTable).key(metaKey(event.osId()));
+        if (meta == null) check.conditionExpression("attribute_not_exists(osId)");
+        else check.conditionExpression("cycleId = :cycle AND estado = :state")
+                .expressionAttributeValues(Map.of(":cycle", AttributeValue.fromS(cycle),
+                        ":state", AttributeValue.fromS(state)));
+        try {
+            client.transactWriteItems(TransactWriteItemsRequest.builder().transactItems(
+                    TransactWriteItem.builder().conditionCheck(check.build()).build(),
+                    markerAction(event), outboxAction(event)).build());
+        } catch (TransactionCanceledException e) {
+            if (!jaProcessado(event.causationId()))
+                throw new EstoqueException("Ciclo de reserva mudou durante o evento", e);
+        }
+    }
+
     @Override
-    public void registrarResultado(MessageEnvelope event) {
+    public void registrarRecusa(MessageEnvelope event, UUID cycleId) {
         if (jaProcessado(event.causationId())) return;
         try {
             client.transactWriteItems(TransactWriteItemsRequest.builder().transactItems(
+                    cycleTombstoneAction(event.osId(), cycle(cycleId)),
                     markerAction(event), outboxAction(event)).build());
         } catch (TransactionCanceledException e) {
-            if (!jaProcessado(event.causationId())) throw e;
+            if (!jaProcessado(event.causationId()))
+                throw new EstoqueException("Ciclo de reserva ja utilizado", e);
         }
     }
 
@@ -242,8 +380,10 @@ public final class DynamoEstoqueRepository implements EstoqueRepository {
         List<Reservation> reservations = new ArrayList<>();
         for (var page : client.queryPaginator(query)) {
             for (var item : page.items()) {
+                if (META.equals(item.get("pecaId").s())) continue;
                 reservations.add(new Reservation(UUID.fromString(item.get("pecaId").s()),
-                        Integer.parseInt(item.get("quantidade").n()), item.get("estado").s()));
+                        Integer.parseInt(item.get("quantidade").n()), item.get("estado").s(),
+                        item.containsKey("cycleId") ? item.get("cycleId").s() : LEGACY));
             }
         }
         return reservations;
@@ -302,5 +442,6 @@ public final class DynamoEstoqueRepository implements EstoqueRepository {
         return value;
     }
 
-    private record Reservation(UUID pecaId, int quantity, String state) { }
+    private record Reservation(UUID pecaId, int quantity, String state, String cycle) { }
+    private record CycleMeta(String cycle, String state) { }
 }

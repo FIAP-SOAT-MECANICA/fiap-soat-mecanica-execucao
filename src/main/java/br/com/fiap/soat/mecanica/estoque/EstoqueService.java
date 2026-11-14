@@ -21,6 +21,16 @@ public final class EstoqueService {
         repository.reservar(new ReservaEstoque(osId, pecas), Objects.requireNonNull(event));
     }
 
+    public void reservar(UUID osId, Map<UUID, Integer> pecas, UUID cycleId, MessageEnvelope event) {
+        repository.reservar(new ReservaEstoque(osId, pecas, cycleId), Objects.requireNonNull(event));
+    }
+
+    public void reservar(UUID osId, Map<UUID, Integer> pecas, UUID cycleId,
+            String expectedPreviousCycleId, MessageEnvelope event) {
+        repository.reservar(new ReservaEstoque(osId, pecas, cycleId, expectedPreviousCycleId),
+                Objects.requireNonNull(event));
+    }
+
     public void confirmar(UUID osId) {
         repository.confirmar(Objects.requireNonNull(osId, "osId"));
     }
@@ -33,7 +43,13 @@ public final class EstoqueService {
         repository.liberar(Objects.requireNonNull(osId, "osId"), Objects.requireNonNull(event));
     }
 
+    public void liberar(UUID osId, UUID cycleId, MessageEnvelope event) {
+        repository.liberar(Objects.requireNonNull(osId, "osId"), cycleId, Objects.requireNonNull(event));
+    }
+
     public boolean jaProcessado(UUID messageId) { return repository.jaProcessado(messageId); }
 
-    public void registrarResultado(MessageEnvelope event) { repository.registrarResultado(event); }
+    public void registrarRecusa(MessageEnvelope event, UUID cycleId) {
+        repository.registrarRecusa(event, cycleId);
+    }
 }

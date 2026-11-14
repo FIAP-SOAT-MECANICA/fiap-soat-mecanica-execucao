@@ -71,11 +71,12 @@ if ($diagnosed.status -ne 'AGUARDANDO_APROVACAO') {
     throw 'Concluir diagnóstico não alterou o status para AGUARDANDO_APROVACAO.'
 }
 $reserveId = [guid]::NewGuid().ToString()
+$cycleId = [guid]::NewGuid().ToString()
 $reserve = @{
     messageId = $reserveId; type = 'ReservarPecas'; version = 1
     sagaId = $sagaId; osId = $osId; correlationId = "demo-$osId"
     causationId = $commandId; occurredAt = [DateTime]::UtcNow.ToString('o')
-    payload = @{ osId = $osId; pecas = @(@{ pecaId = $pecaId; qtd = 1 }) }
+    payload = @{ osId = $osId; cycleId = $cycleId; pecas = @(@{ pecaId = $pecaId; qtd = 1 }) }
 } | ConvertTo-Json -Depth 8 -Compress
 Invoke-LocalAws @('sqs', 'send-message', '--queue-url', $queue, '--message-body', $reserve) | Out-Null
 
@@ -137,7 +138,7 @@ if (-not $refused) { throw 'A second OS was not refused when stock was exhausted
 $start = @{
     messageId = [guid]::NewGuid().ToString(); type = 'IniciarExecucao'; version = 1
     sagaId = $sagaId; osId = $osId; correlationId = "demo-$osId"
-    occurredAt = [DateTime]::UtcNow.ToString('o'); payload = @{ osId = $osId }
+    occurredAt = [DateTime]::UtcNow.ToString('o'); payload = @{ osId = $osId; cycleId = $cycleId }
 } | ConvertTo-Json -Depth 8 -Compress
 Invoke-LocalAws @('sqs', 'send-message', '--queue-url', $queue, '--message-body', $start) | Out-Null
 $started = $false
@@ -160,11 +161,13 @@ if ($finished.status -ne 'FINALIZADA') {
 $releasePiece = Invoke-RestMethod "$BaseUrl/pecas" -Method Post -ContentType 'application/json' -Body $pieceBody
 $releaseOsId = [guid]::NewGuid().ToString()
 $releaseSagaId = [guid]::NewGuid().ToString()
+$releaseCycleId = [guid]::NewGuid().ToString()
 $releaseReserve = @{
     messageId = [guid]::NewGuid().ToString(); type = 'ReservarPecas'; version = 1
     sagaId = $releaseSagaId; osId = $releaseOsId; correlationId = "demo-$releaseOsId"
     occurredAt = [DateTime]::UtcNow.ToString('o')
-    payload = @{ osId = $releaseOsId; pecas = @(@{ pecaId = $releasePiece.pecaId; qtd = 1 }) }
+    payload = @{ osId = $releaseOsId; cycleId = $releaseCycleId;
+        pecas = @(@{ pecaId = $releasePiece.pecaId; qtd = 1 }) }
 } | ConvertTo-Json -Depth 8 -Compress
 Invoke-LocalAws @('sqs', 'send-message', '--queue-url', $queue, '--message-body', $releaseReserve) | Out-Null
 $releaseReserved = $false
@@ -179,7 +182,8 @@ if (-not $releaseReserved) { throw 'Reserva para compensação não apareceu em 
 $release = @{
     messageId = [guid]::NewGuid().ToString(); type = 'LiberarReservaPecas'; version = 1
     sagaId = $releaseSagaId; osId = $releaseOsId; correlationId = "demo-$releaseOsId"
-    occurredAt = [DateTime]::UtcNow.ToString('o'); payload = @{ osId = $releaseOsId }
+    occurredAt = [DateTime]::UtcNow.ToString('o');
+    payload = @{ osId = $releaseOsId; cycleId = $releaseCycleId }
 } | ConvertTo-Json -Depth 8 -Compress
 Invoke-LocalAws @('sqs', 'send-message', '--queue-url', $queue, '--message-body', $release) | Out-Null
 $restored = $false
@@ -210,8 +214,50 @@ foreach ($expected in @("${osId}:ExecucaoIniciada", "${osId}:ExecucaoFinalizada"
         "${releaseOsId}:ReservaPecasLiberada")) {
     if (-not $lateEvents.Contains($expected)) { throw "Evento ausente: $expected" }
 }
+
+$nextCycleId = [guid]::NewGuid().ToString()
+$nextReserve = @{
+    messageId = [guid]::NewGuid().ToString(); type = 'ReservarPecas'; version = 1
+    sagaId = $releaseSagaId; osId = $releaseOsId; correlationId = "demo-$releaseOsId"
+    occurredAt = [DateTime]::UtcNow.ToString('o')
+    payload = @{ osId = $releaseOsId; cycleId = $nextCycleId;
+        expectedPreviousCycleId = $releaseCycleId;
+        pecas = @(@{ pecaId = $releasePiece.pecaId; qtd = 1 }) }
+} | ConvertTo-Json -Depth 8 -Compress
+Invoke-LocalAws @('sqs', 'send-message', '--queue-url', $queue, '--message-body', $nextReserve) | Out-Null
+$reservedAgain = $false
+for ($attempt = 0; $attempt -lt 20; $attempt++) {
+    $releaseStock = Invoke-RestMethod "$BaseUrl/pecas/$($releasePiece.pecaId)"
+    if ($releaseStock.qtdDisponivel -eq 0 -and $releaseStock.qtdReservada -eq 1) {
+        $reservedAgain = $true; break
+    }
+    Start-Sleep -Seconds 1
+}
+if (-not $reservedAgain) { throw 'Nova reserva após liberação não apareceu em 20 segundos.' }
+Invoke-LocalAws @('sqs', 'send-message', '--queue-url', $queue, '--message-body', $release) | Out-Null
+Start-Sleep -Seconds 3
+$releaseStock = Invoke-RestMethod "$BaseUrl/pecas/$($releasePiece.pecaId)"
+if ($releaseStock.qtdDisponivel -ne 0 -or $releaseStock.qtdReservada -ne 1) {
+    throw 'Reentrega da liberação antiga afetou o novo ciclo.'
+}
+$nextRelease = @{
+    messageId = [guid]::NewGuid().ToString(); type = 'LiberarReservaPecas'; version = 1
+    sagaId = $releaseSagaId; osId = $releaseOsId; correlationId = "demo-$releaseOsId"
+    occurredAt = [DateTime]::UtcNow.ToString('o')
+    payload = @{ osId = $releaseOsId; cycleId = $nextCycleId }
+} | ConvertTo-Json -Depth 8 -Compress
+Invoke-LocalAws @('sqs', 'send-message', '--queue-url', $queue, '--message-body', $nextRelease) | Out-Null
+$restoredAgain = $false
+for ($attempt = 0; $attempt -lt 20; $attempt++) {
+    $releaseStock = Invoke-RestMethod "$BaseUrl/pecas/$($releasePiece.pecaId)"
+    if ($releaseStock.qtdDisponivel -eq 1 -and $releaseStock.qtdReservada -eq 0) {
+        $restoredAgain = $true; break
+    }
+    Start-Sleep -Seconds 1
+}
+if (-not $restoredAgain) { throw 'Liberação do novo ciclo não restaurou disponibilidade.' }
 $markerKey = @{ messageId = @{ S = $commandId } } | ConvertTo-Json -Depth 4 -Compress
 $marker = Invoke-LocalAws @('dynamodb', 'get-item', '--table-name', 'execucao-idempotencia',
     '--key', $markerKey, '--output', 'json') | ConvertFrom-Json
 if (-not $marker.Item.messageId.S) { throw 'Diagnosis command idempotency marker is missing.' }
-Write-Host "PASS osId=$osId pecaId=$pecaId; diagnóstico, reserva, recusa, início, finalização e liberação verificados localmente."
+Write-Host "PASS osId=$osId pecaId=$pecaId; início atômico, re-reserva e reentrega antiga verificadas localmente."

@@ -40,6 +40,10 @@ class EstoqueCommandHandler {
             throw new IllegalArgumentException("Comando de estoque inválido");
         }
         if (!"IniciarExecucao".equals(command.type()) && estoque.jaProcessado(command.messageId())) return;
+        UUID cycleId = command.payload().hasNonNull("cycleId")
+                ? UUID.fromString(command.payload().path("cycleId").asText()) : null;
+        String expectedPreviousCycleId = command.payload().hasNonNull("expectedPreviousCycleId")
+                ? command.payload().path("expectedPreviousCycleId").asText() : null;
         Map<UUID, Integer> faltantes = Map.of();
         switch (command.type()) {
             case "ReservarPecas" -> {
@@ -55,7 +59,8 @@ class EstoqueCommandHandler {
                         throw new IllegalArgumentException("Peça ou quantidade inválida");
                 }
                 try {
-                    estoque.reservar(command.osId(), pecas, event(command, "PecasReservadas",
+                    estoque.reservar(command.osId(), pecas, cycleId, expectedPreviousCycleId,
+                            event(command, "PecasReservadas",
                             mapper.createObjectNode().put("osId", command.osId().toString())));
                 } catch (EstoqueSemDisponibilidadeException e) {
                     faltantes = e.faltantes();
@@ -63,23 +68,24 @@ class EstoqueCommandHandler {
                     var array = payload.putArray("faltantes");
                     faltantes.forEach((pecaId, quantidade) -> array.addObject()
                             .put("pecaId", pecaId.toString()).put("qtd", quantidade));
-                    estoque.registrarResultado(event(command, "ReservaPecasRecusada", payload));
+                    estoque.registrarRecusa(event(command, "ReservaPecasRecusada", payload), cycleId);
                 }
             }
             case "LiberarReservaPecas" -> {
-                estoque.liberar(command.osId(), event(command, "ReservaPecasLiberada",
+                estoque.liberar(command.osId(), cycleId, event(command, "ReservaPecasLiberada",
                         mapper.createObjectNode().put("osId", command.osId().toString())));
             }
             case "IniciarExecucao" -> {
-                estoque.confirmar(command.osId());
-                workflow.iniciarExecucao(command.osId(), command.correlationId());
-                return; // The order transition and ExecucaoIniciada outbox write are atomic.
+                workflow.iniciarExecucao(command, cycleId);
+                return;
             }
             default -> throw new IllegalArgumentException("Comando de estoque desconhecido");
         }
     }
 
     private MessageEnvelope event(MessageEnvelope command, String eventType, ObjectNode payload) {
+        if (command.payload().hasNonNull("cycleId"))
+            payload.put("cycleId", command.payload().path("cycleId").asText());
         UUID eventId = UUID.nameUUIDFromBytes((command.messageId() + ":" + eventType)
                 .getBytes(StandardCharsets.UTF_8));
         return new MessageEnvelope(eventId, eventType, 1, command.sagaId(), command.osId(),

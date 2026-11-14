@@ -30,7 +30,9 @@ Durante `EM_DIAGNOSTICO`, use `POST /execucoes/{osId}/prestacoes` com `{ "servic
 
 O cadastro de peças usa `POST /pecas` e `PUT /pecas/{id}` com `{ "nome": "Filtro", "descricao": "Filtro de óleo", "valorUnitario": 29.90, "qtdEstoque": 1 }`. `GET /pecas` e `GET /pecas/{id}` retornam também `qtdDisponivel` e `qtdReservada`. A criação responde 201 com `Location`; alterações incompatíveis com uma reserva respondem 409.
 
-O comando `IniciarExecucao` confirma a reserva e muda a execução para `EM_EXECUCAO`, iniciando as prestações ativas. `PATCH /prestacoes/{id}/finalizar` conclui uma prestação; a última ativa muda a execução para `FINALIZADA` e grava `ExecucaoFinalizada` na mesma transação. As mudanças no documento usam versão otimista; conflitos retornam 409 para uma nova tentativa. O lookup dos IDs de prestação e alocação hoje usa scan paginado e deve ganhar índice dedicado quando o volume crescer.
+Os comandos `ReservarPecas`, `LiberarReservaPecas` e `IniciarExecucao` aceitam `cycleId` (UUID) no `payload`. O mesmo ID deve acompanhar os três comandos de uma reserva. Após a liberação, uma nova reserva exige um UUID novo e `expectedPreviousCycleId` igual ao ciclo liberado. Comandos antigos ou atrasados não alteram a reserva nova. Comandos sem `cycleId` são aceitos apenas no primeiro ciclo legado. O serviço OS ainda precisa adotar esse contrato antes de validar a Saga integrada.
+
+O comando `IniciarExecucao` confirma a reserva, muda a execução para `EM_EXECUCAO`, inicia as prestações ativas e grava `ExecucaoIniciada` e o marcador do comando na mesma transação DynamoDB. `PATCH /prestacoes/{id}/finalizar` conclui uma prestação; a última ativa muda a execução para `FINALIZADA` e grava `ExecucaoFinalizada` na mesma transação. As mudanças no documento usam versão otimista; conflitos retornam 409 para uma nova tentativa. O lookup dos IDs de prestação e alocação hoje usa scan paginado e deve ganhar índice dedicado quando o volume crescer.
 
 ## Tabelas DynamoDB
 
@@ -43,7 +45,7 @@ O comando `IniciarExecucao` confirma a reserva e muda a execução para `EM_EXEC
 As três tabelas de diagnóstico participam da mesma `TransactWriteItems`. Reserva e liberação de peças usam `TransactWriteItems` condicional; a marca de idempotência e o evento da outbox acompanham os contadores na mesma transação. O publicador varre a outbox pendente; após a publicação, remove o item. Em caso de falha entre publicação e remoção, pode publicar novamente, portanto os consumidores também precisam deduplicar por `messageId`.
 
 O modelo, as condições de concorrência e as limitações de escala estão descritos na [RFC-F4-02](docs/RFC-F4-02-dynamodb-execucao.md). O código usa `DynamoDbClient` do AWS SDK v2 e comandos de transação de baixo nível.
-O pivô `IniciarExecucao` ainda confirma estoque e muda a ordem em operações separadas. A revisão do orçamento após uma reserva liberada também requer integração adicional; consulte a RFC antes de usar esses caminhos como evidência de Saga completa.
+O pivô `IniciarExecucao` e a re-reserva após liberação são atômicos no serviço Execução. Ainda falta o produtor de `cycleId` no serviço OS e a validação entre serviços; consulte a RFC antes de usar esses caminhos como evidência de Saga completa.
 
 ## Infraestrutura e entrega
 
